@@ -268,6 +268,7 @@ interface SkVMConfig {
     hermes?: string | AdapterEntrySettings
     jiuwenclaw?: string | AdapterEntrySettings
     pi?: string | AdapterEntrySettings
+    "claude-code"?: string | AdapterEntrySettings
   }
   proposalsDir?: string
   providers?: unknown
@@ -390,7 +391,7 @@ export function getHeadlessAgentConfig(): HeadlessAgentConfig {
  * shape at read time so callers only deal with one representation.
  */
 export function getAdapterSettings(
-  adapter: "opencode" | "openclaw" | "hermes" | "jiuwenclaw" | "pi",
+  adapter: "opencode" | "openclaw" | "hermes" | "jiuwenclaw" | "pi" | "claude-code",
 ): AdapterEntrySettings {
   const config = getProjectConfig()
   const raw = config.adapters?.[adapter]
@@ -399,7 +400,7 @@ export function getAdapterSettings(
   return raw
 }
 
-export function getAdapterRepoDir(adapter: "opencode" | "openclaw" | "hermes" | "jiuwenclaw" | "pi"): string | undefined {
+export function getAdapterRepoDir(adapter: "opencode" | "openclaw" | "hermes" | "jiuwenclaw" | "pi" | "claude-code"): string | undefined {
   const repo = getAdapterSettings(adapter).repoPath
   if (!repo) return undefined
   return expandHome(repo)

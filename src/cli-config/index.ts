@@ -12,6 +12,7 @@
  */
 
 import { existsSync, readFileSync, writeFileSync, copyFileSync, mkdirSync, chmodSync, accessSync, readdirSync, unlinkSync, constants as fsConst } from "node:fs"
+import { spawnSync } from "node:child_process"
 import path from "node:path"
 import { stdin } from "node:process"
 
@@ -40,6 +41,7 @@ import type { ProviderKind, AdapterConfigMode } from "../core/types.ts"
 import { ALL_ADAPTERS, type AdapterName } from "../adapters/registry.ts"
 import { resolveUserHermesDir as resolveHermesProfileDir } from "../adapters/hermes.ts"
 import { resolveUserOpencodeConfigFile as resolveOpencodeConfigFile } from "../adapters/opencode.ts"
+import { resolveUserClaudeDir } from "../adapters/claude-code.ts"
 import { shortenPath } from "../core/banner.ts"
 
 const EXAMPLE_PATH = path.join(PROJECT_ROOT, "skvm.config.example.json")
@@ -195,9 +197,10 @@ async function runShow(): Promise<void> {
     }
     const dir = getAdapterRepoDir(a as ConfigurableAdapter)
     if (!dir) {
+      const probeName = a === "claude-code" ? "claude" : a
       const fallback = a === "opencode"
         ? "not configured (will use `which opencode` on PATH, then bundled copy)"
-        : "not configured (will use `which " + a + "` on PATH)"
+        : `not configured (will use \`which ${probeName}\` on PATH)`
       console.log(`  ${a.padEnd(labelW)}  ${c.dim(fallback)}`)
     } else {
       const ok = existsSync(dir)
@@ -855,13 +858,33 @@ async function configureAdapter(a: ConfigurableAdapter, cur: AdapterDraft): Prom
   try {
     const next: AdapterDraft = {}
 
-    const repoAns = (await input({
-      message: withHelp(
+    // claude-code is shipped as a single `claude` binary, not a buildable
+    // checkout — the prompt copy reflects that and offers `which claude`
+    // autodetect as the default.
+    let repoMessage: string
+    let repoDefault: string
+    if (a === "claude-code") {
+      const detected = whichBinary("claude")
+      repoMessage = withHelp(
+        "Path to the claude binary (optional)",
+        "Absolute path to the `claude` executable.",
+        detected
+          ? `Leave empty to use ${shortenPath(detected)} (auto-detected via \`which claude\`).`
+          : "Leave empty to use whatever `which claude` finds at run time.",
+      )
+      repoDefault = cur.repoPath ?? ""
+    } else {
+      repoMessage = withHelp(
         "Local checkout path (optional)",
         "Local git clone of the adapter — skvm will build / run it from source.",
         "Leave empty to use the binary already on your $PATH.",
-      ),
-      default: cur.repoPath ?? "",
+      )
+      repoDefault = cur.repoPath ?? ""
+    }
+
+    const repoAns = (await input({
+      message: repoMessage,
+      default: repoDefault,
       transformer: typeHint,
       theme: INPUT_THEME,
     })).trim()
@@ -904,6 +927,16 @@ async function configureAdapter(a: ConfigurableAdapter, cur: AdapterDraft): Prom
         console.log(c.yellow(`  ⚠ ${shortenPath(env)} missing — native mode may lack API keys.`))
       }
     }
+    if (a === "claude-code") {
+      const userDir = resolveUserClaudeDir()
+      const settingsFile = path.join(userDir, "settings.json")
+      if (existsSync(settingsFile)) {
+        console.log(c.green(`  ✓ found ${shortenPath(settingsFile)} (native mode ready)`))
+      } else {
+        console.log(c.yellow(`  ⚠ ${shortenPath(settingsFile)} missing — native mode will error until you run \`claude /login\`.`))
+      }
+      console.log(c.dim("  Managed mode requires an `anthropic` route in providers.routes."))
+    }
     if (a === "jiuwenclaw") {
       console.log(c.yellow("  note: jiuwenclaw only supports --adapter-config=managed."))
     }
@@ -927,6 +960,17 @@ async function configureAdapter(a: ConfigurableAdapter, cur: AdapterDraft): Prom
     if (isExit(e)) return null
     throw e
   }
+}
+
+function whichBinary(name: string): string | null {
+  try {
+    const r = spawnSync("which", [name], { encoding: "utf8" })
+    if (r.status === 0 && r.stdout) {
+      const out = r.stdout.trim()
+      return out || null
+    }
+  } catch { /* best-effort */ }
+  return null
 }
 
 function listOpenclawAgents(): string[] {
@@ -1191,7 +1235,15 @@ async function runDoctor(): Promise<void> {
     // Unconfigured adapters get a neutral `—` row and skip deeper checks —
     // the user didn't ask for this adapter, so we shouldn't flag anything red.
     if (!adapterHasConfig) {
-      results.push({ status: "info", label: `Adapter ${a}`, detail: "not configured" })
+      if (a === "claude-code") {
+        const found = whichBinary("claude")
+        results.push(found
+          ? { status: "info", label: `Adapter ${a}`, detail: `not configured (will use ${shortenPath(found)} on PATH)` }
+          : { status: "info", label: `Adapter ${a}`, detail: "not configured (no `claude` on PATH either)" },
+        )
+      } else {
+        results.push({ status: "info", label: `Adapter ${a}`, detail: "not configured" })
+      }
       continue
     }
 
@@ -1201,6 +1253,16 @@ async function runDoctor(): Promise<void> {
       } else {
         results.push({ status: "ok", label: `Adapter ${a} checkout`, detail: shortenPath(dir) })
       }
+    } else if (a === "claude-code") {
+      // claude-code is shipped as a binary; if the user didn't pin a path,
+      // verify `which claude` finds something so they're not surprised at
+      // run-time. This branch is conditional on adapter being configured
+      // (we only get here if `adapterHasConfig` was true).
+      const found = whichBinary("claude")
+      results.push(found
+        ? { status: "ok", label: `claude binary on PATH`, detail: shortenPath(found) }
+        : { status: "fail", label: `claude binary on PATH`, detail: `\`which claude\` returned nothing — install Claude Code or set adapters.claude-code.repoPath` },
+      )
     }
     // Native-mode readiness: skip if user defaults to managed AND adapter has no native-specific setting.
     const defMode = getDefaultAdapterConfigMode() ?? "managed"
@@ -1215,6 +1277,13 @@ async function runDoctor(): Promise<void> {
       results.push(existsSync(modelsJson)
         ? { status: "ok", label: `openclaw native source agent "${srcAgent}"`, detail: shortenPath(modelsJson) }
         : { status: "fail", label: `openclaw native source agent "${srcAgent}"`, detail: `${shortenPath(modelsJson)} missing — native mode will error` },
+      )
+    } else if (a === "claude-code") {
+      const userDir = resolveUserClaudeDir()
+      const settingsFile = path.join(userDir, "settings.json")
+      results.push(existsSync(settingsFile)
+        ? { status: "ok", label: `claude-code native config`, detail: shortenPath(settingsFile) }
+        : { status: "fail", label: `claude-code native config`, detail: `${shortenPath(settingsFile)} missing — run \`claude /login\` or switch to managed` },
       )
     } else if (a === "opencode") {
       const cfg = resolveOpencodeConfigFile()

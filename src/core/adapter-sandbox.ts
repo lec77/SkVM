@@ -285,3 +285,55 @@ export function buildOpenCodeConfigContent(route: ProviderRoute, bareModelId: st
 
   return JSON.stringify(injected)
 }
+
+// ---------------------------------------------------------------------------
+// Shared helper: build a managed-mode settings.json for claude-code
+// ---------------------------------------------------------------------------
+
+/**
+ * Synthesize a minimal `~/.claude/settings.json` that pins the model and tells
+ * Claude Code to read its API key from the env var skvm injects via
+ * `envForRoute()` (typically `ANTHROPIC_API_KEY`). `bareModelId` is the
+ * provider-stripped id.
+ *
+ * Managed mode for claude-code is supported only for `kind: "anthropic"`
+ * routes. The CLI does support Bedrock and Vertex via env-driven config, but
+ * routing those through a synthesized settings.json would mean replicating
+ * Anthropic's full provider matrix in skvm — the user is better served by
+ * native mode for those backends. OpenAI-compatible / OpenRouter routes
+ * cannot reach Anthropic-only Claude Code at all, so we fail fast.
+ */
+export function buildClaudeCodeSettingsContent(route: ProviderRoute, bareModelId: string): string {
+  if (route.kind !== "anthropic") {
+    throw new Error(
+      `buildClaudeCodeSettingsContent: claude-code managed mode supports only anthropic routes; ` +
+      `got kind=${route.kind} for match "${route.match}". Use --adapter-config=native to leverage ` +
+      `Claude Code's own provider config (Bedrock, Vertex, OAuth, third-party gateways).`,
+    )
+  }
+
+  const apiKey = resolveRouteApiKey(route)
+  if (!apiKey) {
+    log.warn(
+      `route "${route.match}" has no resolved API key — the claude-code subprocess will fail to authenticate ` +
+      `unless ANTHROPIC_API_KEY is already set in the parent environment.`,
+    )
+  }
+
+  // Claude Code reads ANTHROPIC_API_KEY from its own process env, not from
+  // settings.json. The adapter injects it via envForRoute() at spawn time;
+  // the settings.json `env` block here forwards the same key to child
+  // processes Claude Code spawns (Bash tool, etc.) so they can also reach
+  // the API if they need to.
+  const settings: Record<string, unknown> = {
+    model: bareModelId,
+    env: {
+      ANTHROPIC_API_KEY: apiKey ?? "",
+    },
+    permissions: {
+      defaultMode: "bypassPermissions",
+    },
+  }
+
+  return JSON.stringify(settings, null, 2)
+}

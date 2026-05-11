@@ -14,6 +14,7 @@
 import path from "node:path"
 import { existsSync, readdirSync, readFileSync, statSync } from "node:fs"
 import { parseNDJSON, type OpenCodeEvent } from "./opencode.ts"
+import { parseClaudeCodeStreamJSON, type ClaudeCodeEvent } from "./claude-code.ts"
 
 const DIAGNOSE_TIMEOUT_MS = 500
 
@@ -221,6 +222,68 @@ function extractOpencodeErrorMessage(event: OpenCodeEvent): string | undefined {
   }
   const message = (part as Record<string, unknown>).message
   if (typeof message === "string") return message
+  return undefined
+}
+
+// ---------------------------------------------------------------------------
+// claude-code
+// ---------------------------------------------------------------------------
+
+export async function diagnoseClaudeCode(input: DiagnoseInput): Promise<FailureDiagnosis | null> {
+  return withDeadline(async () => {
+    const events = parseClaudeCodeStreamJSON(input.stdout)
+    // Result event with is_error=true is the most reliable signal — it's
+    // emitted whether the failure was auth, model-not-found, or a downstream
+    // 5xx. The .result string is already a one-liner shaped for humans.
+    for (let i = events.length - 1; i >= 0; i--) {
+      const ev = events[i]!
+      if (ev.type === "result" && ev.is_error && typeof ev.result === "string" && ev.result.trim()) {
+        const hint = inferClaudeCodeHint(ev)
+        return {
+          summary: `claude-code: ${ev.result.trim()}`,
+          ...(hint ? { hint } : {}),
+          source: "claude-code:result-event",
+        }
+      }
+    }
+    // Plain "error" envelopes — used by the CLI for catastrophic init errors.
+    for (let i = events.length - 1; i >= 0; i--) {
+      const ev = events[i]!
+      if (ev.type === "error") {
+        const msg = extractClaudeCodeErrorMessage(ev)
+        if (msg) return { summary: `claude-code: ${msg}`, source: "claude-code:error-event" }
+      }
+    }
+    const tail = pickStderrErrorLine(input.stderr)
+    if (tail) return { summary: `claude-code: ${tail}`, source: "claude-code:stderr" }
+    return null
+  }, null)
+}
+
+function extractClaudeCodeErrorMessage(event: ClaudeCodeEvent): string | undefined {
+  const msg = (event as Record<string, unknown>).message
+  if (typeof msg === "string") return msg
+  const err = (event as Record<string, unknown>).error
+  if (typeof err === "string") return err
+  if (err && typeof err === "object") {
+    const m = (err as Record<string, unknown>).message
+    if (typeof m === "string") return m
+  }
+  return undefined
+}
+
+function inferClaudeCodeHint(ev: ClaudeCodeEvent): string | undefined {
+  const text = typeof ev.result === "string" ? ev.result.toLowerCase() : ""
+  if (text.includes("not logged in") || text.includes("/login")) {
+    return "Run `claude /login` (native mode) or set ANTHROPIC_API_KEY (managed mode)."
+  }
+  if (text.includes("issue with the selected model") || ev.api_error_status === 404) {
+    return "Check the --model id matches a Claude Code-supported model (dash form, e.g. claude-sonnet-4-6)."
+  }
+  if (ev.api_error_status === 401 || text.includes("authentication")) {
+    return "Verify ANTHROPIC_API_KEY (managed) or session token (native: `claude /login`)."
+  }
+  if (ev.api_error_status === 429) return "Rate-limited by Anthropic — wait or reduce concurrency."
   return undefined
 }
 
