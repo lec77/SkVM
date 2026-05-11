@@ -28,6 +28,11 @@ SkVM is a compilation and runtime system that makes LLM agent skills portable ac
 
 Reference: **SkVM: Revisiting Language VM for Skills across Heterogenous LLMs and Harnesses** — https://arxiv.org/abs/2604.03088
 
+## News
+
+- **2026-05** — New `claude-code` adapter (drives the `claude -p` CLI). Note: heavy headless usage may hit account rate limits or usage-terms issues.
+- **2026-05** — Upload and optimize a skill with SkVM in your browser: [SkVM website](https://skillvm.ai/index.html#optimize-skill).
+
 ## Demo
 
 ### SkVM Optimization: Skill Quality Comparison

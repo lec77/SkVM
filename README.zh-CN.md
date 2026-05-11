@@ -28,6 +28,11 @@ SkVM 是一个面向 LLM Agent Skill 的编译与运行时系统，用来让 Ski
 
 参考论文：**SkVM: Revisiting Language VM for Skills across Heterogenous LLMs and Harnesses** — https://arxiv.org/abs/2604.03088
 
+## 最新动态
+
+- **2026-05** — 新增 `claude-code` adapter（驱动 `claude -p` CLI）。注意：大量 headless 调用可能触发账号限流或与使用条款冲突。
+- **2026-05** — 在浏览器里上传并使用 SkVM 优化 Skill：[SkVM website](https://skillvm.ai/index.html#optimize-skill)。
+
 ## Demo
 
 ### SkVM 优化 skill 质量对比
