@@ -406,33 +406,8 @@ export function resolveUserClaudeDir(): string {
 }
 
 // ---------------------------------------------------------------------------
-// Skill-mode helpers
+// Skill detection helpers (init-event structural + Skill-tool behavioral)
 // ---------------------------------------------------------------------------
-
-/**
- * Sentinel string written into the injected system prompt so we can detect
- * — by grepping the assistant's text — whether the model actually read the
- * skill content. Mirrors the CONTEXT.md trick in opencode.ts.
- */
-const SKILL_INJECT_SENTINEL = "<skvm-skill-injected/>"
-
-function injectedSystemPrompt(skillContent: string): string {
-  return `${SKILL_INJECT_SENTINEL}\n\n${skillContent}`
-}
-
-export function detectSkillInject(events: ClaudeCodeEvent[], snippet: string): boolean {
-  for (const ev of events) {
-    if (ev.type !== "assistant" || !ev.message) continue
-    const content = Array.isArray(ev.message.content) ? ev.message.content : []
-    for (const c of content) {
-      if (!c || (c as { type?: string }).type !== "text") continue
-      const text = (c as ClaudeCodeContentText).text
-      if (text.includes(SKILL_INJECT_SENTINEL)) return true
-      if (snippet.length > 20 && text.includes(snippet)) return true
-    }
-  }
-  return false
-}
 
 /**
  * Structural signal for discover mode: does CC's `system.init` event
@@ -478,16 +453,6 @@ export function detectSkillObserved_Discover(events: ClaudeCodeEvent[], skillNam
     }
   }
   return false
-}
-
-/** @deprecated Since 2026-05. Use `detectSkillProvided_Discover` and
- *  `detectSkillObserved_Discover` separately — they answer the structural
- *  ("did the harness register the skill?") and behavioral ("did the model
- *  invoke it?") questions respectively, which the old combined predicate
- *  conflated. This shim returns the OR of both helpers; remove in a
- *  future release once no consumer relies on the unified predicate. */
-export function detectSkillDiscover(events: ClaudeCodeEvent[], skillName: string): boolean {
-  return detectSkillProvided_Discover(events, skillName) || detectSkillObserved_Discover(events, skillName)
 }
 
 // ---------------------------------------------------------------------------

@@ -7,8 +7,6 @@ import {
   eventsToRunResult,
   ClaudeCodeAdapter,
   toClaudeCodeModelId,
-  detectSkillInject,
-  detectSkillDiscover,
   detectSkillProvided_Discover,
   detectSkillObserved_Discover,
   buildClaudeCodeInjectArtifacts,
@@ -297,41 +295,6 @@ describe("ClaudeCodeAdapter shape", () => {
   })
 })
 
-describe("detectSkillInject", () => {
-  test("returns true when assistant text echoes the sentinel", () => {
-    const events: ClaudeCodeEvent[] = [{
-      type: "assistant",
-      message: { content: [{ type: "text", text: "Got it: <skvm-skill-injected/>" }] },
-    }]
-    expect(detectSkillInject(events, "irrelevant snippet over twenty chars")).toBe(true)
-  })
-
-  test("returns true when assistant text quotes a long-enough skill snippet", () => {
-    const snippet = "Detailed instructions about file ops"
-    const events: ClaudeCodeEvent[] = [{
-      type: "assistant",
-      message: { content: [{ type: "text", text: `I'll follow these: ${snippet}.` }] },
-    }]
-    expect(detectSkillInject(events, snippet)).toBe(true)
-  })
-
-  test("ignores short snippets to avoid false positives", () => {
-    const events: ClaudeCodeEvent[] = [{
-      type: "assistant",
-      message: { content: [{ type: "text", text: "the" }] },
-    }]
-    expect(detectSkillInject(events, "the")).toBe(false)
-  })
-
-  test("returns false when no assistant event mentions the sentinel or snippet", () => {
-    const events: ClaudeCodeEvent[] = [
-      { type: "system", subtype: "init" },
-      { type: "assistant", message: { content: [{ type: "text", text: "hello" }] } },
-    ]
-    expect(detectSkillInject(events, "a snippet that is definitely not echoed back")).toBe(false)
-  })
-})
-
 describe("detectSkillProvided_Discover (init-event signal)", () => {
   test("returns true when init event lists the skill", () => {
     const events: ClaudeCodeEvent[] = [
@@ -409,32 +372,6 @@ describe("detectSkillObserved_Discover (Skill tool-use signal)", () => {
       },
     ]
     expect(detectSkillObserved_Discover(events, "bench-skill")).toBe(false)
-  })
-})
-
-describe("detectSkillDiscover (deprecated back-compat shim)", () => {
-  test("returns true if EITHER provided or observed is true", () => {
-    // Init-event only (provided=true, observed=false)
-    const provOnly: ClaudeCodeEvent[] = [
-      { type: "system", subtype: "init", skills: ["bench-skill"] },
-    ]
-    expect(detectSkillDiscover(provOnly, "bench-skill")).toBe(true)
-
-    // Skill tool only (provided=false, observed=true)
-    const obsOnly: ClaudeCodeEvent[] = [
-      {
-        type: "assistant",
-        message: { content: [{ type: "tool_use", id: "t1", name: "Skill", input: { name: "bench-skill" } }] },
-      },
-    ]
-    expect(detectSkillDiscover(obsOnly, "bench-skill")).toBe(true)
-  })
-
-  test("returns false when neither signal is present", () => {
-    const events: ClaudeCodeEvent[] = [
-      { type: "assistant", message: { content: [{ type: "text", text: "hi" }] } },
-    ]
-    expect(detectSkillDiscover(events, "bench-skill")).toBe(false)
   })
 })
 
