@@ -491,6 +491,60 @@ export function detectSkillDiscover(events: ClaudeCodeEvent[], skillName: string
 }
 
 // ---------------------------------------------------------------------------
+// Inject / Discover artifact builders
+// ---------------------------------------------------------------------------
+
+/**
+ * Build the on-disk artifacts and CLI arguments needed to register a skill
+ * with CC's native skill system in inject (forced-load) mode.
+ *
+ * Inject = "skill is required for this task". Writes the SKILL.md file into
+ * the project-scope `.claude/skills/` directory (CC announces this in the
+ * `system.init` event's `skills[]` array — that's our `skillProvided`
+ * signal, independent of model behavior). The returned `appendSystemPrompt`
+ * carries a MUST directive that mandates calling the Skill tool — this is
+ * what makes inject behaviorally different from discover.
+ *
+ * Factored out of run() for direct testability without spawning CC.
+ */
+export async function buildClaudeCodeInjectArtifacts(opts: {
+  workDir: string
+  skillContent: string
+  skillMeta: { name: string; description: string }
+}): Promise<{ appendSystemPrompt: string }> {
+  const { workDir, skillContent, skillMeta } = opts
+  const skillDir = path.join(workDir, ".claude", "skills", skillMeta.name)
+  await mkdir(skillDir, { recursive: true })
+  const frontmatter = `---\nname: ${skillMeta.name}\ndescription: ${skillMeta.description}\n---\n\n`
+  await Bun.write(path.join(skillDir, "SKILL.md"), frontmatter + skillContent)
+  const appendSystemPrompt =
+    `You have access to a project skill named \`${skillMeta.name}\` ` +
+    `(${skillMeta.description}). ` +
+    `You MUST invoke the Skill tool with name="${skillMeta.name}" ` +
+    `before any other action, and you MUST follow its instructions.`
+  return { appendSystemPrompt }
+}
+
+/**
+ * Discover-mode (progressive-disclosure) artifacts: write the skill file
+ * to `.claude/skills/<name>/SKILL.md` and return no system-prompt
+ * directive. CC's normal description-matching + Skill tool exposure path
+ * takes over from here; the model decides whether to invoke.
+ */
+export async function buildClaudeCodeDiscoverArtifacts(opts: {
+  workDir: string
+  skillContent: string
+  skillMeta: { name: string; description: string }
+}): Promise<Record<string, never>> {
+  const { workDir, skillContent, skillMeta } = opts
+  const skillDir = path.join(workDir, ".claude", "skills", skillMeta.name)
+  await mkdir(skillDir, { recursive: true })
+  const frontmatter = `---\nname: ${skillMeta.name}\ndescription: ${skillMeta.description}\n---\n\n`
+  await Bun.write(path.join(skillDir, "SKILL.md"), frontmatter + skillContent)
+  return {}
+}
+
+// ---------------------------------------------------------------------------
 // Adapter
 // ---------------------------------------------------------------------------
 
@@ -601,25 +655,35 @@ export class ClaudeCodeAdapter implements AgentAdapter {
   }): Promise<RunResult> {
     const skillMode = task.skillMode ?? "inject"
     const skillName = task.skillMeta?.name ?? "bench-skill"
-    let skillLoaded: boolean | undefined
+    const skillDesc = task.skillMeta?.description ?? "Benchmark skill injected by SkVM"
     let appendSystemPrompt: string | undefined
+    let skillProvided: boolean | undefined
+    let skillObserved: boolean | undefined
 
     if (task.skillContent) {
-      skillLoaded = false
       if (skillMode === "inject") {
-        // --append-system-prompt is the documented headless way to inject
-        // extra context. The sentinel lets us verify the model actually
-        // saw the skill (matches opencode's CONTEXT.md trick).
-        appendSystemPrompt = injectedSystemPrompt(task.skillContent)
+        // Forced load: write the skill into CC's native registry AND add a
+        // hard directive instructing the model to invoke the Skill tool.
+        // The structural confirmation (system.init event listing the skill)
+        // is independent of model behavior, which makes it robust against
+        // thinking-mode models that don't echo system prompt content.
+        const artifacts = await buildClaudeCodeInjectArtifacts({
+          workDir: task.workDir,
+          skillContent: task.skillContent,
+          skillMeta: { name: skillName, description: skillDesc },
+        })
+        appendSystemPrompt = artifacts.appendSystemPrompt
       } else {
-        // Discover: <workDir>/.claude/skills/ is project-scope, so it works
-        // regardless of sandbox HOME — managed-mode runs ship the skill too.
-        const skillDesc = task.skillMeta?.description ?? "Benchmark skill injected by SkVM"
-        const skillDir = path.join(task.workDir, ".claude", "skills", skillName)
-        await mkdir(skillDir, { recursive: true })
-        const frontmatter = `---\nname: ${skillName}\ndescription: ${skillDesc}\n---\n\n`
-        await Bun.write(path.join(skillDir, "SKILL.md"), frontmatter + task.skillContent)
+        // Discoverable: write the skill file without a force directive.
+        // CC's progressive disclosure based on description match takes over.
+        await buildClaudeCodeDiscoverArtifacts({
+          workDir: task.workDir,
+          skillContent: task.skillContent,
+          skillMeta: { name: skillName, description: skillDesc },
+        })
       }
+      // Provisional; overwritten from the init event after the run.
+      skillProvided = false
     }
 
     const startMs = performance.now()
@@ -679,18 +743,28 @@ export class ClaudeCodeAdapter implements AgentAdapter {
 
     const events = parseClaudeCodeStreamJSON(stdout)
 
-    if (task.skillContent && skillLoaded === false) {
-      if (skillMode === "inject") {
-        const snippet = task.skillContent.replace(/^#.*\n/m, "").trim().slice(0, 60)
-        skillLoaded = detectSkillInject(events, snippet)
-      } else {
-        skillLoaded = detectSkillDiscover(events, skillName)
-      }
+    if (task.skillContent) {
+      // Structural signal — same source in both modes: CC's init event
+      // either listed our skill or it didn't. Independent of model behavior.
+      skillProvided = detectSkillProvided_Discover(events, skillName)
+      // Behavioral signal — also same source in both modes. In inject mode
+      // the MUST directive should drive this to true on compliant models;
+      // in discover mode it depends on progressive disclosure.
+      skillObserved = detectSkillObserved_Discover(events, skillName)
     }
 
     const result = eventsToRunResult(events, task.workDir, durationMs)
-    if (skillLoaded !== undefined) {
-      result.skillLoaded = skillLoaded
+    if (skillProvided !== undefined) {
+      result.skillProvided = skillProvided
+      // Mirror to deprecated alias so any reader still on `skillLoaded`
+      // sees the same value during the migration window.
+      result.skillLoaded = skillProvided
+    }
+    if (skillObserved !== undefined) {
+      result.skillObserved = skillObserved
+    }
+    if (task.skillContent) {
+      result.skillMode = skillMode
     }
     if (timedOut) {
       result.runStatus = "timeout"

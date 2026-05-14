@@ -1,4 +1,7 @@
 import { test, expect, describe } from "bun:test"
+import { tmpdir } from "node:os"
+import path from "node:path"
+import { mkdtemp, rm } from "node:fs/promises"
 import {
   parseClaudeCodeStreamJSON,
   eventsToRunResult,
@@ -8,6 +11,8 @@ import {
   detectSkillDiscover,
   detectSkillProvided_Discover,
   detectSkillObserved_Discover,
+  buildClaudeCodeInjectArtifacts,
+  buildClaudeCodeDiscoverArtifacts,
   type ClaudeCodeEvent,
 } from "../../src/adapters/claude-code.ts"
 
@@ -430,6 +435,80 @@ describe("detectSkillDiscover (deprecated back-compat shim)", () => {
       { type: "assistant", message: { content: [{ type: "text", text: "hi" }] } },
     ]
     expect(detectSkillDiscover(events, "bench-skill")).toBe(false)
+  })
+})
+
+describe("claude-code inject mode uses CC's native skill system", () => {
+  test("inject artifacts: writes .claude/skills/<name>/SKILL.md with frontmatter + MUST directive", async () => {
+    const tmpWork = await mkdtemp(path.join(tmpdir(), "skvm-cc-inject-"))
+    try {
+      const built = await buildClaudeCodeInjectArtifacts({
+        workDir: tmpWork,
+        skillContent: "# Test skill\n\nDo the thing.",
+        skillMeta: { name: "bench-skill", description: "test skill" },
+      })
+      const skillFile = path.join(tmpWork, ".claude", "skills", "bench-skill", "SKILL.md")
+      expect(await Bun.file(skillFile).exists()).toBe(true)
+      const content = await Bun.file(skillFile).text()
+      expect(content).toContain("name: bench-skill")
+      expect(content).toContain("description: test skill")
+      expect(content).toContain("Do the thing.")
+
+      expect(built.appendSystemPrompt).toBeDefined()
+      expect(built.appendSystemPrompt!).toContain("You MUST invoke the Skill tool")
+      expect(built.appendSystemPrompt!).toContain('name="bench-skill"')
+    } finally {
+      await rm(tmpWork, { recursive: true, force: true })
+    }
+  })
+
+  test("discover artifacts: writes the skill file WITHOUT a force directive", async () => {
+    const tmpWork = await mkdtemp(path.join(tmpdir(), "skvm-cc-disc-"))
+    try {
+      const built = await buildClaudeCodeDiscoverArtifacts({
+        workDir: tmpWork,
+        skillContent: "# Test skill\n\nDo the thing.",
+        skillMeta: { name: "bench-skill", description: "test skill" },
+      })
+      const skillFile = path.join(tmpWork, ".claude", "skills", "bench-skill", "SKILL.md")
+      expect(await Bun.file(skillFile).exists()).toBe(true)
+      // Discover returns no appendSystemPrompt — the field is undefined in the return.
+      expect((built as { appendSystemPrompt?: string }).appendSystemPrompt).toBeUndefined()
+    } finally {
+      await rm(tmpWork, { recursive: true, force: true })
+    }
+  })
+
+  test("thinking-mode-safe: skillProvided=true even when model never echoes content", () => {
+    // The init event is our structural signal — it does not depend on model
+    // behavior. Simulate a thinking-mode run where the assistant produces
+    // no visible text echoing the skill, but CC's init event lists it.
+    const events: ClaudeCodeEvent[] = [
+      { type: "system", subtype: "init", skills: ["bench-skill"], tools: ["Skill", "Bash"] },
+      {
+        type: "assistant",
+        message: {
+          content: [{ type: "tool_use", id: "t1", name: "Skill", input: { name: "bench-skill" } }],
+          usage: { input_tokens: 10, output_tokens: 5 },
+        },
+      },
+      { type: "result", is_error: false, total_cost_usd: 0.001, usage: { input_tokens: 10, output_tokens: 5 } },
+    ]
+    expect(detectSkillProvided_Discover(events, "bench-skill")).toBe(true)
+    expect(detectSkillObserved_Discover(events, "bench-skill")).toBe(true)
+  })
+
+  test("inject without model engagement: skillProvided=true (init), skillObserved=false (no Skill tool call)", () => {
+    const events: ClaudeCodeEvent[] = [
+      { type: "system", subtype: "init", skills: ["bench-skill"] },
+      {
+        type: "assistant",
+        message: { content: [{ type: "text", text: "done." }], usage: { input_tokens: 5, output_tokens: 2 } },
+      },
+      { type: "result", is_error: false, total_cost_usd: 0.001 },
+    ]
+    expect(detectSkillProvided_Discover(events, "bench-skill")).toBe(true)
+    expect(detectSkillObserved_Discover(events, "bench-skill")).toBe(false)
   })
 })
 
