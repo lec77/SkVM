@@ -8,6 +8,7 @@
 
 import { assertNoLegacyHeadlessFields, getHeadlessAgentConfig } from "../config.ts"
 import { runOpenCodeDriver } from "./opencode-driver.ts"
+import { runPiDriver } from "./pi-driver.ts"
 import {
   HeadlessAgentError,
   isHeadlessAgentError,
@@ -34,6 +35,6 @@ export async function runHeadlessAgent(
   assertNoLegacyHeadlessFields()
   const driver = opts.driver ?? getHeadlessAgentConfig().driver
   if (driver === "opencode") return runOpenCodeDriver(opts)
-  // "pi" is not yet routed — Task 5 wires the pi-driver branch.
+  if (driver === "pi") return runPiDriver(opts)
   throw new Error(`Unknown headless agent driver: ${driver}`)
 }
