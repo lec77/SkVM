@@ -51,62 +51,88 @@ export async function runPiDriver(
   // Per-call temp agentDir so SettingsManager / models.json are sandboxed.
   // In a fresh tmpdir none exist so all pi defaults apply.
   const agentDir = await mkdtemp(path.join(tmpdir(), "skvm-headless-pi-"))
-  const modelsJson = renderPiModelsJson(route)
-  if (modelsJson) await Bun.write(path.join(agentDir, "models.json"), modelsJson)
 
-  // Credentials via AuthStorage runtime overrides (same path as pi's
-  // --api-key CLI flag). NOT process.env — concurrent calls would race.
-  const authStorage = AuthStorage.inMemory()
-  const apiKey = resolveRouteApiKey(route)
-  if (apiKey) authStorage.setRuntimeApiKey(piProvider, apiKey)
-
-  const modelRegistry = ModelRegistry.create(authStorage, path.join(agentDir, "models.json"))
-  const model = modelRegistry.find(piProvider, piModelId)
-  if (!model) {
-    await rm(agentDir, { recursive: true, force: true })
-    throw new HeadlessAgentError(
-      `pi could not resolve model "${piModel}" (route=${route.match}). ` +
-      `Check providers.routes maps to a pi-supported provider.`,
-      "pi", 1, false, "",
-    )
-  }
-
-  const settingsManager = SettingsManager.create(cwd, agentDir)
-  const sessionManager = SessionManager.inMemory(cwd)
-  const resourceLoader = new DefaultResourceLoader({
-    cwd, agentDir, settingsManager,
-    noExtensions: true,
-    noSkills: true,
-    noPromptTemplates: true,
-    noThemes: true,
-    noContextFiles: true,
-  })
-  await resourceLoader.reload()
-
-  const { session } = await createAgentSession({
-    cwd, agentDir,
-    authStorage, modelRegistry,
-    model,
-    sessionManager, settingsManager,
-    resourceLoader,
-    tools: [readTool, bashTool, editTool, writeTool, grepTool, findTool, lsTool],
-  })
-
-  const events: AgentSessionEvent[] = []
-  const unsubscribe = session.subscribe(e => events.push(e))
-
+  // Hoist mutable handles so the outer finally can clean them up regardless
+  // of which step threw (model-not-found, SettingsManager.create,
+  // resourceLoader.reload, createAgentSession, or session.prompt).
+  let timer: ReturnType<typeof setTimeout> | undefined
+  let unsubscribe: (() => void) | undefined
+  let session: Awaited<ReturnType<typeof createAgentSession>>["session"] | undefined
   let timedOut = false
-  const timer = opts.timeoutMs
-    ? setTimeout(() => { timedOut = true; void session.abort() }, opts.timeoutMs)
-    : undefined
 
-  log.debug(`pi-driver start: cwd=${cwd} model=${piProvider}/${piModelId}`)
-  const start = Date.now()
   try {
-    await session.prompt(
-      `IMPORTANT: Do not ask clarifying questions. Proceed directly ` +
-      `with implementation.\n\n${opts.prompt}`,
-    )
+    const modelsJson = renderPiModelsJson(route)
+    if (modelsJson) await Bun.write(path.join(agentDir, "models.json"), modelsJson)
+
+    // Credentials via AuthStorage runtime overrides (same path as pi's
+    // --api-key CLI flag). NOT process.env — concurrent calls would race.
+    const authStorage = AuthStorage.inMemory()
+    const apiKey = resolveRouteApiKey(route)
+    if (apiKey) authStorage.setRuntimeApiKey(piProvider, apiKey)
+
+    const modelRegistry = ModelRegistry.create(authStorage, path.join(agentDir, "models.json"))
+    const model = modelRegistry.find(piProvider, piModelId)
+    if (!model) {
+      throw new HeadlessAgentError(
+        `pi could not resolve model "${piModel}" (route=${route.match}). ` +
+        `Check providers.routes maps to a pi-supported provider.`,
+        "pi", 1, false, "",
+      )
+    }
+
+    const settingsManager = SettingsManager.create(cwd, agentDir)
+    const sessionManager = SessionManager.inMemory(cwd)
+    const resourceLoader = new DefaultResourceLoader({
+      cwd, agentDir, settingsManager,
+      noExtensions: true,
+      noSkills: true,
+      noPromptTemplates: true,
+      noThemes: true,
+      noContextFiles: true,
+    })
+    await resourceLoader.reload()
+
+    const created = await createAgentSession({
+      cwd, agentDir,
+      authStorage, modelRegistry,
+      model,
+      sessionManager, settingsManager,
+      resourceLoader,
+      tools: [readTool, bashTool, editTool, writeTool, grepTool, findTool, lsTool],
+    })
+    session = created.session
+
+    const events: AgentSessionEvent[] = []
+    unsubscribe = session.subscribe(e => events.push(e))
+
+    if (opts.timeoutMs) {
+      // session is assigned above; the ! is safe — if the timer fires, session exists.
+      timer = setTimeout(() => { timedOut = true; void session!.abort() }, opts.timeoutMs)
+    }
+
+    log.debug(`pi-driver start: cwd=${cwd} model=${piProvider}/${piModelId}`)
+    const start = Date.now()
+    try {
+      await session.prompt(
+        `IMPORTANT: Do not ask clarifying questions. Proceed directly ` +
+        `with implementation.\n\n${opts.prompt}`,
+      )
+    } catch (err) {
+      const durationMs = Date.now() - start
+      if (err instanceof HeadlessAgentError) throw err
+      if (opts.throwOnError ?? true) {
+        throw new HeadlessAgentError(
+          `pi session threw: ${(err as Error).message ?? err}`,
+          "pi", 1, timedOut, String((err as Error).stack ?? ""),
+        )
+      }
+      return {
+        exitCode: 1, durationMs, timedOut,
+        cost: 0, tokens: emptyTokenUsage(),
+        rawStdout: "", rawStderr: String(err), driver: "pi",
+      }
+    }
+
     const durationMs = Date.now() - start
 
     if (timedOut && (opts.throwOnError ?? true)) {
@@ -130,23 +156,10 @@ export async function runPiDriver(
       rawStderr: "",
       driver: "pi",
     }
-  } catch (err) {
-    if (err instanceof HeadlessAgentError) throw err
-    if (opts.throwOnError ?? true) {
-      throw new HeadlessAgentError(
-        `pi session threw: ${(err as Error).message ?? err}`,
-        "pi", 1, timedOut, String((err as Error).stack ?? ""),
-      )
-    }
-    return {
-      exitCode: 1, durationMs: 0, timedOut,
-      cost: 0, tokens: emptyTokenUsage(),
-      rawStdout: "", rawStderr: String(err), driver: "pi",
-    }
   } finally {
     if (timer) clearTimeout(timer)
-    unsubscribe()
-    session.dispose()
+    unsubscribe?.()
+    session?.dispose()
     await rm(agentDir, { recursive: true, force: true })
   }
 }
