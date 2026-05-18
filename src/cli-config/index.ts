@@ -37,7 +37,8 @@ import {
   getDefaultAdapterConfigMode,
   detectLegacyHeadlessFields,
 } from "../core/config.ts"
-import type { ProviderKind, AdapterConfigMode } from "../core/types.ts"
+import type { ProviderKind, AdapterConfigMode, HeadlessAgentDriverName } from "../core/types.ts"
+import { HeadlessAgentDriverSchema } from "../core/types.ts"
 import { ALL_ADAPTERS, type AdapterName } from "../adapters/registry.ts"
 import { resolveUserHermesDir as resolveHermesProfileDir } from "../adapters/hermes.ts"
 import { resolveUserOpencodeConfigFile as resolveOpencodeConfigFile } from "../adapters/opencode.ts"
@@ -60,7 +61,7 @@ interface RouteDraft {
 }
 
 interface HeadlessAgentDraft {
-  driver?: "opencode"
+  driver?: HeadlessAgentDriverName
   opencodePath?: string
 }
 
@@ -512,7 +513,8 @@ function loadExistingDraft(): ConfigDraft {
   if (raw.headlessAgent && typeof raw.headlessAgent === "object") {
     const ha = raw.headlessAgent as Record<string, unknown>
     const preserved: HeadlessAgentDraft = {}
-    if (ha.driver === "opencode") preserved.driver = "opencode"
+    const parsedDriver = HeadlessAgentDriverSchema.safeParse(ha.driver)
+    if (parsedDriver.success) preserved.driver = parsedDriver.data
     if (typeof ha.opencodePath === "string") preserved.opencodePath = ha.opencodePath
     if (Object.keys(preserved).length > 0) draft.headlessAgent = preserved
   }
