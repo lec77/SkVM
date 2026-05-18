@@ -23,6 +23,7 @@ import {
   parsePiNDJSON,
   piEventsToRunResult,
   toPiModel,
+  splitPiModel,
   renderPiModelsJson,
 } from "../core/pi-runtime.ts"
 
@@ -182,7 +183,8 @@ export class PiAdapter implements AgentAdapter {
       // no auth.json is needed. Only write models.json when the route has a
       // custom baseUrl that pi can't pick up from env vars.
       const route = resolveRoute(config.model)
-      const doc = renderPiModelsJson(route)
+      const { modelId: piModelId } = splitPiModel(this.model)
+      const doc = renderPiModelsJson(route, piModelId)
       if (doc) await Bun.write(path.join(root, "models.json"), doc)
     }
 

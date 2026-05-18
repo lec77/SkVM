@@ -61,7 +61,7 @@ export async function runPiDriver(
   let timedOut = false
 
   try {
-    const modelsJson = renderPiModelsJson(route)
+    const modelsJson = renderPiModelsJson(route, piModelId)
     if (modelsJson) await Bun.write(path.join(agentDir, "models.json"), modelsJson)
 
     // Credentials via AuthStorage runtime overrides (same path as pi's

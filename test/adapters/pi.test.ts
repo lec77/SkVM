@@ -326,19 +326,33 @@ describe("toPiModel", () => {
 })
 
 describe("renderPiModelsJson", () => {
-  test("emits openai baseUrl override for openai-compatible routes", async () => {
+  test("emits openai baseUrl override and model registration for openai-compatible routes", async () => {
     const { renderPiModelsJson } = await import("../../src/core/pi-runtime.ts")
     const route = { match: "ipads/*", kind: "openai-compatible" as const, baseUrl: "http://example/v1" }
-    const json = renderPiModelsJson(route)
+    const json = renderPiModelsJson(route, "gpt-4o-mini")
     expect(json).not.toBeNull()
-    expect(JSON.parse(json!)).toEqual({ providers: { openai: { baseUrl: "http://example/v1" } } })
+    expect(JSON.parse(json!)).toEqual({
+      providers: {
+        openai: {
+          baseUrl: "http://example/v1",
+          models: [{ id: "gpt-4o-mini" }],
+        },
+      },
+    })
+  })
+
+  test("registers the exact modelId provided", async () => {
+    const { renderPiModelsJson } = await import("../../src/core/pi-runtime.ts")
+    const route = { match: "cheap_ipads/*", kind: "openai-compatible" as const, baseUrl: "http://proxy/v1" }
+    const json = renderPiModelsJson(route, "gpt-5.5")
+    expect(JSON.parse(json!).providers.openai.models).toEqual([{ id: "gpt-5.5" }])
   })
 
   test("returns null when no override is needed", async () => {
     const { renderPiModelsJson } = await import("../../src/core/pi-runtime.ts")
-    expect(renderPiModelsJson({ match: "anthropic/*", kind: "anthropic" })).toBeNull()
-    expect(renderPiModelsJson({ match: "openrouter/*", kind: "openrouter" })).toBeNull()
-    expect(renderPiModelsJson({ match: "ipads/*", kind: "openai-compatible" })).toBeNull()
+    expect(renderPiModelsJson({ match: "anthropic/*", kind: "anthropic" }, "claude-sonnet-4.6")).toBeNull()
+    expect(renderPiModelsJson({ match: "openrouter/*", kind: "openrouter" }, "qwen/qwen3-30b")).toBeNull()
+    expect(renderPiModelsJson({ match: "ipads/*", kind: "openai-compatible" }, "gpt-4o")).toBeNull()
   })
 })
 
