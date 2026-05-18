@@ -82,11 +82,13 @@ mock.module("@mariozechner/pi-coding-agent", () => {
 
 // Import-under-test must come AFTER mock.module setup.
 import { runHeadlessAgent } from "../../src/core/headless-agent/index.ts"
+import { resetConfigCacheForTesting } from "../../src/core/config.ts"
 
 const SKVM_CACHE = process.env.SKVM_CACHE!
 const CONFIG_PATH = path.join(SKVM_CACHE, "skvm.config.json")
 
 beforeAll(async () => {
+  resetConfigCacheForTesting()
   await Bun.write(CONFIG_PATH, JSON.stringify({
     providers: {
       routes: [
@@ -99,6 +101,7 @@ beforeAll(async () => {
 
 afterAll(() => {
   try { rmSync(CONFIG_PATH, { force: true }) } catch {}
+  resetConfigCacheForTesting()
 })
 
 beforeEach(() => {

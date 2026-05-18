@@ -4,10 +4,14 @@
  * cross-cutting concerns live.
  */
 
-import type { TokenUsage } from "../types.ts"
+import type { TokenUsage, HeadlessAgentDriverName } from "../types.ts"
 
-/** Identifier for the concrete agent backend. Extend as more are added. */
-export type HeadlessAgentDriver = "opencode" | "pi"
+/**
+ * Identifier for the concrete agent backend. Re-exports the canonical
+ * schema-derived type so the union stays in sync with
+ * `HeadlessAgentDriverSchema` automatically.
+ */
+export type HeadlessAgentDriver = HeadlessAgentDriverName
 
 export interface HeadlessAgentRunOptions {
   /** Working directory the agent will operate in (its cwd). */
