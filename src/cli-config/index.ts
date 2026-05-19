@@ -208,7 +208,10 @@ async function runShow(): Promise<void> {
     console.log(`  ${"match".padEnd(colW)}  kind                 auth`)
     for (const r of providers.routes) {
       const tail = r.kind === "openai-compatible" && r.baseUrl ? ` ${c.dim(`@ ${r.baseUrl}`)}` : ""
-      console.log(`  ${r.match.padEnd(colW)}  ${r.kind.padEnd(20)} ${authBadge(r)}${tail}`)
+      const auto = r.discoveredAt
+        ? `  ${c.dim(`(auto-discovered ${r.discoveredAt.slice(0, 10)})`)}`
+        : ""
+      console.log(`  ${r.match.padEnd(colW)}  ${r.kind.padEnd(20)} ${authBadge(r)}${tail}${auto}`)
     }
   }
 
