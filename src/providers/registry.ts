@@ -217,10 +217,14 @@ function instantiate(
       return new OpenRouterProvider({ apiKey, model: stripRoutingPrefix(modelId) })
 
     case "anthropic":
-      // Anthropic SDK expects a bare id ("claude-sonnet-4.6").
+      // Anthropic SDK expects a bare id ("claude-sonnet-4.6"). When the
+      // route specifies a custom baseUrl (e.g., a third-party Anthropic-
+      // compatible gateway), thread it through — the SDK appends
+      // `/v1/messages` itself.
       return new AnthropicProvider({
         apiKey,
         model: stripRoutingPrefix(modelId),
+        baseUrl: overrides?.baseUrl ?? route.baseUrl,
       })
 
     case "openai-compatible": {
