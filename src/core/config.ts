@@ -286,6 +286,17 @@ export const CONFIG_WRITE_PATH = path.join(SKVM_CACHE, "skvm.config.json")
 let _configPath: string | undefined
 
 /**
+ * Derive the skvm.config.json path under the current SKVM_CACHE root.
+ * Re-reads `process.env.SKVM_CACHE` at call time so test code that
+ * overrides the env var between calls sees the updated path.
+ */
+function currentConfigWritePath(): string {
+  const env = process.env.SKVM_CACHE
+  if (env) return path.join(path.resolve(env), "skvm.config.json")
+  return CONFIG_WRITE_PATH
+}
+
+/**
  * Resolved on-disk path for `skvm.config.json`. Lazy + memoized so that
  * commands which never read the config (e.g. `--version`) skip the existsSync
  * syscalls.
@@ -299,10 +310,11 @@ let _configPath: string | undefined
  */
 export function getConfigPath(): string {
   if (_configPath) return _configPath
-  if (existsSync(CONFIG_WRITE_PATH)) return _configPath = CONFIG_WRITE_PATH
+  const writePath = currentConfigWritePath()
+  if (existsSync(writePath)) return _configPath = writePath
   const legacy = path.join(PROJECT_ROOT, "skvm.config.json")
   if (existsSync(legacy)) return _configPath = legacy
-  return _configPath = CONFIG_WRITE_PATH
+  return _configPath = writePath
 }
 
 export function getProjectConfig(): SkVMConfig {
@@ -445,4 +457,17 @@ export function resolveAdapterConfigMode(flagValue: string | undefined): Adapter
  */
 export function getProposalsRoot(): string {
   return PROPOSALS_ROOT
+}
+
+/**
+ * Test-only: clear all module-level config caches so the next call to
+ * `getConfigPath` / `getProjectConfig` / `getProvidersConfig` re-derives
+ * from the current `process.env.SKVM_CACHE`. Call this in `beforeEach` when
+ * a test overrides `SKVM_CACHE` between runs.
+ */
+export function __resetConfigCacheForTest(): void {
+  _configPath = undefined
+  _configCache = undefined
+  _providersConfigCache = undefined
+  _headlessAgentConfigCache = undefined
 }
