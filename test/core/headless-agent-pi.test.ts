@@ -215,7 +215,7 @@ describe("runHeadlessAgent (driver=pi, library mode)", () => {
           model: "anthropic/claude-sonnet-4.6",
           timeoutMs: 5000,
         })
-      ).rejects.toThrow(/stopReason=error/)
+      ).rejects.toThrow(/stopReason=error: fake provider 5xx/)
     } finally {
       rmSync(workDir, { recursive: true, force: true })
     }

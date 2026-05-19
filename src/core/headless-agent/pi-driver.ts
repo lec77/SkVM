@@ -151,11 +151,25 @@ export async function runPiDriver(
     // into HeadlessAgentError so callers can distinguish "infra failed" from
     // "agent produced an empty result". Subprocess driver gets this for free
     // via exit codes; the library path has to do it explicitly.
-    if (runStats.adapterError && (opts.throwOnError ?? true)) {
-      throw new HeadlessAgentError(
-        `pi agent_end stopReason=error: ${runStats.adapterError.stderr}`,
-        "pi", 1, false, runStats.adapterError.stderr,
-      )
+    if (runStats.adapterError) {
+      if (opts.throwOnError ?? true) {
+        throw new HeadlessAgentError(
+          `pi agent_end stopReason=error: ${runStats.adapterError.stderr}`,
+          "pi", 1, false, runStats.adapterError.stderr,
+        )
+      }
+      // throwOnError: false — mirror the catch-block shape so callers see
+      // exitCode=1 and rawStderr populated rather than silent success.
+      return {
+        exitCode: 1,
+        durationMs,
+        timedOut,
+        cost: runStats.cost,
+        tokens: runStats.tokens,
+        rawStdout: JSON.stringify(events),
+        rawStderr: runStats.adapterError.stderr,
+        driver: "pi",
+      }
     }
 
     return {

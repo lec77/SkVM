@@ -178,11 +178,12 @@ export class PiAdapter implements AgentAdapter {
       symlinkIfExists(path.join(PI_USER_AGENT_DIR, "tools"), path.join(root, "tools"))
       symlinkIfExists(path.join(PI_USER_AGENT_DIR, "bin"), path.join(root, "bin"))
     } else {
-      // Managed: start from empty. Pi's auth precedence (auth.json → OAuth →
-      // env var → fallback) means we can authenticate via env vars alone, so
-      // no auth.json is needed. Always write models.json to register the model
-      // id under the matching pi provider so ModelRegistry.find() succeeds on
-      // the library (in-process) path.
+      // Managed: start from empty. Always write models.json — pi's CLI calls
+      // ModelRegistry.find() internally and skvm's dot-form model ids
+      // (e.g. anthropic/claude-sonnet-4.6) are not in pi's built-in catalogue
+      // (which uses dash-form). The registration tells pi the id is valid
+      // and lets api/baseUrl inherit from the built-in provider entries.
+      // Auth flows in via env vars derived from the route — no auth.json needed.
       const route = resolveRoute(config.model)
       const { modelId: piModelId } = splitPiModel(this.model)
       const doc = renderPiModelsJson(route, piModelId)
