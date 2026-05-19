@@ -5,6 +5,9 @@ import { OpenRouterProvider } from "./openrouter.ts"
 import { AnthropicProvider } from "./anthropic.ts"
 import { OpenAICompatibleProvider } from "./openai-compatible.ts"
 import { ProviderAuthError } from "./errors.ts"
+import { AutoProbeProvider, type ProbeOrchestrator } from "./auto-probe.ts"
+import { runProbe, inferAnthropicBaseUrl } from "./probe.ts"
+import { appendDiscoveredRoute } from "../cli-config/index.ts"
 
 /**
  * Built-in fallback route. Applied when `providers.routes` is empty or no
@@ -106,12 +109,58 @@ export function validateModelIdForRoute(modelId: string, route: ProviderRoute): 
  * `overrides` lets test fixtures and exceptional call sites bypass env-var
  * lookup. Never use overrides to "work around" a missing route — add a route
  * instead.
+ *
+ * For openai-compatible routes, the returned provider is wrapped in an
+ * `AutoProbeProvider` that intercepts `ToolArgumentsParseError` failures,
+ * probes the same gateway via its Anthropic-shaped endpoint, and — if the
+ * alt is clean while the primary is polluted — writes a literal anthropic
+ * route and retries via `AnthropicProvider`. Set `SKVM_AUTO_PROBE=0` to
+ * opt out entirely.
  */
 export function createProviderForModel(
   modelId: string,
   overrides?: ProviderOverrides,
 ): LLMProvider {
-  return instantiate(modelId, resolveRoute(modelId), overrides)
+  const route = resolveRoute(modelId)
+  const delegate = instantiate(modelId, route, overrides)
+
+  // Auto-probe is gated to openai-compatible routes; the other kinds can't
+  // produce ToolArgumentsParseError (anthropic returns structured input;
+  // openrouter normalizes reasoning fields).
+  if (route.kind !== "openai-compatible") return delegate
+
+  // Opt-out: env var, then check that auto-probe is even applicable here.
+  if (process.env.SKVM_AUTO_PROBE === "0") return delegate
+  if (!route.baseUrl) return delegate
+
+  const orchestrator: ProbeOrchestrator = async (mid, r) => {
+    const altBase = inferAnthropicBaseUrl(r.baseUrl ?? "")
+    if (!altBase) {
+      return { verdict: { primary: "polluted", alt: "indeterminate" }, altProvider: null, writeRoute: null }
+    }
+    const altApiKey = overrides?.apiKey ?? r.apiKey ?? (r.apiKeyEnv ? process.env[r.apiKeyEnv] : undefined)
+    const altProvider: LLMProvider = new AnthropicProvider({
+      apiKey: altApiKey,
+      model: stripRoutingPrefix(mid),
+      baseUrl: altBase,
+    })
+    const verdict = await runProbe({ primary: delegate, alt: () => altProvider })
+    if (verdict.primary === "polluted" && verdict.alt === "clean") {
+      const writeRoute = async () => appendDiscoveredRoute({
+        match: mid,
+        kind: "anthropic",
+        baseUrl: altBase,
+        apiKey: r.apiKey,
+        apiKeyEnv: r.apiKeyEnv,
+        discoveredAt: new Date().toISOString(),
+        discoveredFrom: r.match,
+      })
+      return { verdict, altProvider, writeRoute }
+    }
+    return { verdict, altProvider: null, writeRoute: null }
+  }
+
+  return new AutoProbeProvider(delegate, modelId, route, orchestrator)
 }
 
 export function findMatchingRoute(

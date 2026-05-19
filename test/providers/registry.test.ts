@@ -14,7 +14,8 @@ import * as configModule from "../../src/core/config.ts"
 // Returning an empty routes array keeps the existing createProviderForModel
 // tests working — they all use openrouter/... ids which fall through to the
 // built-in DEFAULT_ROUTE. The gw_anthropic/* route is only matched by the
-// new test below.
+// new test below. The gw/* route is an openai-compatible route used by the
+// auto-probe wrapping tests.
 // ---------------------------------------------------------------------------
 mock.module("../../src/core/config.ts", () => ({
   ...configModule,
@@ -25,6 +26,12 @@ mock.module("../../src/core/config.ts", () => ({
         kind: "anthropic" as const,
         apiKey: "k",
         baseUrl: "https://gw.example.com",
+      },
+      {
+        match: "gw/*",
+        kind: "openai-compatible" as const,
+        apiKey: "k",
+        baseUrl: "https://gw.example.com/v1",
       },
     ],
   }),
@@ -267,5 +274,43 @@ describe("createProviderForModel — anthropic route with baseUrl", () => {
     await provider.complete({ messages: [{ role: "user", content: "hi" }] })
 
     expect(observedUrl).toBe("https://gw.example.com/v1/messages")
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Auto-probe wrapping tests (Task 3.6)
+// ---------------------------------------------------------------------------
+
+describe("createProviderForModel — AutoProbeProvider wrapping", () => {
+  test("createProviderForModel wraps openai-compatible providers with AutoProbeProvider", () => {
+    // gw/* is an openai-compatible route (added to the mock above).
+    // With SKVM_AUTO_PROBE not set to "0", the returned provider should be
+    // an AutoProbeProvider whose name matches the pattern auto-probe(<delegate>).
+    const saved = process.env.SKVM_AUTO_PROBE
+    delete process.env.SKVM_AUTO_PROBE
+    try {
+      const provider = createProviderForModel("gw/some-model")
+      expect(provider.name).toMatch(/^auto-probe\(/)
+    } finally {
+      if (saved === undefined) delete process.env.SKVM_AUTO_PROBE
+      else process.env.SKVM_AUTO_PROBE = saved
+    }
+  })
+
+  test("createProviderForModel does NOT wrap anthropic-kind routes", () => {
+    const provider = createProviderForModel("gw_anthropic/glm-5-thinking", { apiKey: "k" })
+    expect(provider.name).not.toMatch(/^auto-probe\(/)
+  })
+
+  test("SKVM_AUTO_PROBE=0 env disables the wrapper", () => {
+    const saved = process.env.SKVM_AUTO_PROBE
+    process.env.SKVM_AUTO_PROBE = "0"
+    try {
+      const provider = createProviderForModel("gw/some-model")
+      expect(provider.name).not.toMatch(/^auto-probe\(/)
+    } finally {
+      if (saved === undefined) delete process.env.SKVM_AUTO_PROBE
+      else process.env.SKVM_AUTO_PROBE = saved
+    }
   })
 })
