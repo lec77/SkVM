@@ -76,6 +76,46 @@ describe("AutoProbeProvider", () => {
     expect(thrown).toBe(original)
   })
 
+  test("after probe finds alt, subsequent completeWithToolResults also uses alt", async () => {
+    let delegateToolResultCalls = 0
+    let altToolResultCalls = 0
+    const delegate: LLMProvider = {
+      name: "delegate",
+      complete: async () => { throw new ToolArgumentsParseError("delegate", "<think>x</think>{}") },
+      completeWithToolResults: async () => {
+        delegateToolResultCalls += 1
+        return { text: "from-delegate", toolCalls: [], tokens: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0 }, durationMs: 0, stopReason: "end_turn" as const }
+      },
+    } as unknown as LLMProvider
+    const alt: LLMProvider = {
+      name: "alt",
+      complete: async () => ({ text: "from-alt", toolCalls: [], tokens: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0 }, durationMs: 0, stopReason: "end_turn" as const }),
+      completeWithToolResults: async () => {
+        altToolResultCalls += 1
+        return { text: "from-alt-results", toolCalls: [], tokens: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0 }, durationMs: 0, stopReason: "end_turn" as const }
+      },
+    } as unknown as LLMProvider
+    const route: ProviderRoute = { match: "x/*", kind: "openai-compatible", baseUrl: "https://x.example.com/v1", apiKey: "k" }
+    const wrapper = new AutoProbeProvider(delegate, "x/m", route, async () => ({
+      verdict: { primary: "polluted", alt: "clean" },
+      altProvider: alt,
+      writeRoute: async () => ({ written: true }),
+    }))
+
+    // First call triggers probe, sticky-binds altProvider, returns from alt
+    await wrapper.complete({ messages: [{ role: "user", content: "hi" }] })
+
+    // Subsequent completeWithToolResults must hit alt, not delegate
+    await wrapper.completeWithToolResults(
+      { messages: [{ role: "user", content: "next" }] },
+      [{ toolCallId: "1", content: "result" }],
+      { text: "", toolCalls: [], tokens: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0 }, durationMs: 0, stopReason: "tool_use" as const },
+    )
+
+    expect(delegateToolResultCalls).toBe(0)
+    expect(altToolResultCalls).toBe(1)
+  })
+
   test("guard set prevents re-probing the same modelId in same process", async () => {
     let probeRuns = 0
     const delegate: LLMProvider = {

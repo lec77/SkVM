@@ -41,6 +41,8 @@ export type ProbeOrchestrator = (modelId: string, route: ProviderRoute) => Promi
  */
 export class AutoProbeProvider implements LLMProvider {
   readonly name: string
+  /** Sticky-bound after a successful probe: both complete() and completeWithToolResults() use this. */
+  private altProvider: LLMProvider | null = null
   constructor(
     private readonly delegate: LLMProvider,
     private readonly modelId: string,
@@ -51,6 +53,8 @@ export class AutoProbeProvider implements LLMProvider {
   }
 
   async complete(params: CompletionParams): Promise<LLMResponse> {
+    // If a clean alt was already found this session, skip the delegate entirely.
+    if (this.altProvider) return this.altProvider.complete(params)
     try {
       return await this.delegate.complete(params)
     } catch (err) {
@@ -66,7 +70,9 @@ export class AutoProbeProvider implements LLMProvider {
       if (probed.altProvider && probed.writeRoute) {
         const writeResult = await probed.writeRoute()
         log.info(`auto-probe route ${writeResult.written ? "written" : "already present"} for ${this.modelId}`)
-        return probed.altProvider.complete(params)
+        // Sticky-bind so that subsequent complete() and completeWithToolResults() calls go through alt.
+        this.altProvider = probed.altProvider
+        return this.altProvider.complete(params)
       }
       // No clean alternative; let the original error propagate.
       throw err
@@ -78,7 +84,7 @@ export class AutoProbeProvider implements LLMProvider {
     toolResults: LLMToolResult[],
     previousResponse: LLMResponse,
   ): Promise<LLMResponse> {
-    return this.delegate.completeWithToolResults(params, toolResults, previousResponse)
+    return (this.altProvider ?? this.delegate).completeWithToolResults(params, toolResults, previousResponse)
   }
 }
 

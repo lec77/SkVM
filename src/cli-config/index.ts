@@ -345,8 +345,9 @@ function smokeTestModelId(routes: readonly RouteDraft[]): string {
 const MAX_CONFIG_BACKUPS = 5
 
 function pruneOldConfigBackups(): number {
-  const dir = path.dirname(CONFIG_WRITE_PATH)
-  const prefix = `${path.basename(CONFIG_WRITE_PATH)}.bak.`
+  const configPath = getConfigWritePath()
+  const dir = path.dirname(configPath)
+  const prefix = `${path.basename(configPath)}.bak.`
   let entries: string[]
   try {
     entries = readdirSync(dir)
