@@ -1,6 +1,8 @@
 import path from "node:path"
 import { readdir, mkdir, copyFile } from "node:fs/promises"
 import { createHash } from "node:crypto"
+import { CLI_DEFAULTS } from "./ui-defaults.ts"
+import type { SkillBundle, SkillMode } from "./types.ts"
 
 // ---------------------------------------------------------------------------
 // Content hash helper
@@ -136,4 +138,52 @@ async function listBundleFiles(skillDir: string, prefix = ""): Promise<string[]>
     }
   }
   return out
+}
+
+/**
+ * Build the adapter-facing skill bundle from a loaded `ResolvedSkill`,
+ * applying the CLI default when `mode` is unset. Returns undefined when
+ * no skill is loaded — the all-or-nothing invariant on
+ * `AgentAdapter.run({ skill })` lives here.
+ *
+ * Use this when you have a `ResolvedSkill` (i.e., a skill loaded from
+ * disk via `loadSkill`). For callers that already have `content` and
+ * `meta` in hand (e.g., bench conditions that synthesise content from
+ * concatenated multi-skill text or compiled output), use
+ * `buildSkillBundleFromContent` instead.
+ */
+export function buildSkillBundle(
+  skill: ResolvedSkill | undefined,
+  mode: SkillMode | undefined,
+): SkillBundle | undefined {
+  if (!skill) return undefined
+  return {
+    content: skill.skillContent,
+    meta: skill.skillMeta,
+    mode: mode ?? CLI_DEFAULTS.skillMode,
+  }
+}
+
+/**
+ * Build the adapter-facing skill bundle from raw `content` and `meta`,
+ * applying the CLI default when `mode` is unset.
+ *
+ * Use this when the caller has computed `content` and `meta` directly
+ * (e.g., concatenating multiple skills, parsing compiled skill text)
+ * and a `ResolvedSkill` is not available. For the common case of
+ * loading from disk, use `buildSkillBundle` instead.
+ *
+ * Both helpers funnel through `CLI_DEFAULTS.skillMode` so the default
+ * lives in exactly one place.
+ */
+export function buildSkillBundleFromContent(
+  content: string,
+  meta: { name: string; description: string },
+  mode: SkillMode | undefined,
+): SkillBundle {
+  return {
+    content,
+    meta,
+    mode: mode ?? CLI_DEFAULTS.skillMode,
+  }
 }

@@ -17,7 +17,7 @@ import { runDeferredJudge, readDeferredResults, mergeDeferredResults } from "../
 import { ALL_ADAPTERS, type AdapterName, isAdapterName } from "../adapters/registry.ts"
 import { CLI_DEFAULTS, MODEL_DEFAULTS } from "../core/ui-defaults.ts"
 import { TIMEOUT_DEFAULTS } from "../core/timeouts.ts"
-import { assertKnownFlags } from "../core/cli-flags.ts"
+import { assertKnownFlags, parseSkillModeFlag } from "../core/cli-flags.ts"
 
 const HOME = process.env.HOME ?? ""
 
@@ -76,10 +76,15 @@ export async function runBench(flags: Record<string, string>): Promise<void> {
     return
   }
 
+  // Parse skill mode early — custom-plan mode (below) needs it too,
+  // otherwise `bench --custom ... --skill-mode=discover` would be
+  // accepted (flag is known) but silently ignored.
+  const skillMode = parseSkillModeFlag(flags)
+
   // Handle --custom=<file.yaml>: standalone custom plan mode
   if (flags.custom) {
     const { executeCustomPlan } = await import("./custom-plan.ts")
-    await executeCustomPlan(flags.custom, flags.resume, resolveAdapterConfigMode(flags["adapter-config"]))
+    await executeCustomPlan(flags.custom, flags.resume, resolveAdapterConfigMode(flags["adapter-config"]), skillMode)
     return
   }
 
@@ -98,13 +103,6 @@ export async function runBench(flags: Record<string, string>): Promise<void> {
   }
 
   const tasks = flags.tasks ? flags.tasks.split(",").map(t => t.trim()) : undefined
-
-  // Parse skill mode
-  const skillMode = flags["skill-mode"] as "inject" | "discover" | undefined
-  if (skillMode && skillMode !== "inject" && skillMode !== "discover") {
-    console.error(`Error: unknown skill mode "${skillMode}". Valid: inject, discover`)
-    process.exit(1)
-  }
 
   // Parse adapter(s): comma-separated
   const adapterRaw = (flags.adapter ?? CLI_DEFAULTS.adapter).split(",").map(a => a.trim())

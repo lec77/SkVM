@@ -477,15 +477,21 @@ export function getProposalsRoot(): string {
  * layer writes a discovered route via appendDiscoveredRoute. Without this, a
  * same-process re-resolution would see the stale pre-write config.
  *
- * Also busts the CommonJS `require()` cache for the config file path so that
+ * Also busts the CommonJS `require()` cache for the config file path(s) so that
  * `getProjectConfig`'s synchronous `require()` call re-reads the updated JSON
- * rather than serving the stale in-memory module.
+ * rather than serving the stale in-memory module. Both the currently-resolved
+ * path and the well-known candidate paths are purged, since a caller may
+ * invalidate before or after the singletons have been populated.
  */
 export function invalidateConfigCache(): void {
-  // Bust the require() module cache for the config file before clearing _configPath,
-  // while we still know the path that was cached.
-  const pathToBust = _configPath ?? currentConfigWritePath()
-  try { delete require.cache[require.resolve(pathToBust)] } catch { /* path may not be in cache */ }
+  const candidatePaths = new Set<string>([
+    _configPath ?? currentConfigWritePath(),
+    CONFIG_WRITE_PATH,
+    path.join(PROJECT_ROOT, "skvm.config.json"),
+  ])
+  for (const p of candidatePaths) {
+    try { delete require.cache[require.resolve(p)] } catch { /* path may not be in cache */ }
+  }
   _configPath = undefined
   _configCache = undefined
   _providersConfigCache = undefined
@@ -493,10 +499,26 @@ export function invalidateConfigCache(): void {
 }
 
 /**
- * Test-only: clear all module-level config caches so the next call to
- * `getConfigPath` / `getProjectConfig` / `getProvidersConfig` re-derives
- * from the current `process.env.SKVM_CACHE`. Call this in `beforeEach` when
- * a test overrides `SKVM_CACHE` between runs.
+ * Reset all module-level config caches.
+ *
+ * Intended for test use only. When multiple test files run in the same Bun
+ * worker they share a module registry, so one file's cached config bleeds into
+ * the next file's `beforeAll`. Calling this in `beforeAll` before writing a new
+ * `skvm.config.json` guarantees the file will be read fresh. Delegates to
+ * `invalidateConfigCache` (same singleton + require.cache busting).
+ *
+ * Not intended for production use — the caches exist to avoid repeated disk
+ * I/O across the lifetime of a single CLI invocation.
+ */
+export function resetConfigCacheForTesting(): void {
+  invalidateConfigCache()
+}
+
+/**
+ * Test-only alias retained for the auto-probe test suite. Clears all
+ * module-level config caches so the next call to `getConfigPath` /
+ * `getProjectConfig` / `getProvidersConfig` re-derives from the current
+ * `process.env.SKVM_CACHE`. Equivalent to `resetConfigCacheForTesting`.
  */
 export function __resetConfigCacheForTest(): void {
   invalidateConfigCache()

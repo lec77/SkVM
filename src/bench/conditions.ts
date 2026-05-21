@@ -2,7 +2,7 @@ import path from "node:path"
 import { mkdtemp, mkdir, readdir, copyFile, cp } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { copyDirRecursive } from "../core/fs-utils.ts"
-import type { AgentAdapter, AdapterConfig, TCP, RunResult } from "../core/types.ts"
+import type { AgentAdapter, AdapterConfig, TCP, RunResult, SkillMode } from "../core/types.ts"
 import type { LLMProvider } from "../providers/types.ts"
 import { runTask } from "../framework/runner.ts"
 import type { EvaluatorConfig, EvaluateAllOptions } from "../framework/evaluator.ts"
@@ -11,7 +11,7 @@ import { compileSkill, writeVariant } from "../compiler/index.ts"
 import { ARTIFACT_DIR } from "../compiler/artifacts.ts"
 import { AOT_COMPILE_DIR, toPassTag, safeModelName } from "../core/config.ts"
 import type { BenchTask, BenchCondition, ConditionResult, JitRunReport, EvalDetail } from "./types.ts"
-import { contentHash, copySkillBundle } from "../core/skill-loader.ts"
+import { contentHash, copySkillBundle, parseSkillMeta, buildSkillBundleFromContent } from "../core/skill-loader.ts"
 import type { ResolvedSkill } from "../core/skill-loader.ts"
 import { createLogger } from "../core/logger.ts"
 import { ConversationLog } from "../core/conversation-logger.ts"
@@ -297,6 +297,7 @@ export async function runOriginal(
   adapter: AgentAdapter,
   adapterConfig: AdapterConfig,
   skill: ResolvedSkill | ResolvedSkill[],
+  skillMode?: SkillMode,
   evaluatorConfig?: EvaluatorConfig,
   convLog?: ConversationLog,
   evalOptions?: EvaluateAllOptions,
@@ -308,6 +309,11 @@ export async function runOriginal(
   const workDir = await prepareWorkDir(task)
   await copySkillBundles(skills, workDir)
 
+  const originalSkillContent = concatSkillContents(skills)
+  const originalSkillMeta = skills.length === 1
+    ? skills[0]!.skillMeta
+    : { name: meta.skillId, description: "Multi-skill bundle" }
+
   try {
     const result = await runTask({
       task,
@@ -315,7 +321,7 @@ export async function runOriginal(
       adapterConfig,
       evaluatorConfig,
       convLog,
-      skillContent: concatSkillContents(skills),
+      skill: buildSkillBundleFromContent(originalSkillContent, originalSkillMeta, skillMode),
       workDir,
       keepWorkDir: true,
       evalOptions,
@@ -355,6 +361,7 @@ export async function runJitOptimized(
   skill: ResolvedSkill | ResolvedSkill[],
   harness: string,
   model: string,
+  skillMode?: SkillMode,
   evaluatorConfig?: EvaluatorConfig,
   convLog?: ConversationLog,
   evalOptions?: EvaluateAllOptions,
@@ -397,9 +404,12 @@ export async function runJitOptimized(
     jitOptimizedBundleDirs.push(bestDir)
     log.info(`[jit-optimized] Loaded ${s.skillId} from ${bestDir}`)
   }
-  const skillContent = jitOptimizedContents.length === 1
+  const jitSkillContent = jitOptimizedContents.length === 1
     ? jitOptimizedContents[0]!
     : jitOptimizedContents.join("\n\n---\n\n")
+  const jitSkillMeta = skills.length === 1
+    ? skills[0]!.skillMeta
+    : { name: meta.skillId, description: "Multi-skill bundle" }
 
   const workDir = await prepareWorkDir(task)
   // Copy bundle files from the jit-optimized best-round directories (instead of the original skill dir)
@@ -414,7 +424,7 @@ export async function runJitOptimized(
       adapterConfig,
       evaluatorConfig,
       convLog,
-      skillContent,
+      skill: buildSkillBundleFromContent(jitSkillContent, jitSkillMeta, skillMode),
       workDir,
       keepWorkDir: true,
       evalOptions,
@@ -462,6 +472,7 @@ export async function runAOTVariant(
   compilerProvider: LLMProvider,
   condition: BenchCondition,
   passes: number[],
+  skillMode?: SkillMode,
   evaluatorConfig?: EvaluatorConfig,
   convLog?: ConversationLog,
   evalOptions?: EvaluateAllOptions,
@@ -547,6 +558,8 @@ export async function runAOTVariant(
     }
   } catch { /* no bundled files in compiled variant */ }
 
+  const aotSkillMeta = parseSkillMeta(compiledContent, path.dirname(skillPath))
+
   try {
     const result = await runTask({
       task,
@@ -554,7 +567,7 @@ export async function runAOTVariant(
       adapterConfig,
       evaluatorConfig,
       convLog,
-      skillContent: compiledContent,
+      skill: buildSkillBundleFromContent(compiledContent, aotSkillMeta, skillMode),
       workDir,
       keepWorkDir: true,
       evalOptions,
@@ -597,7 +610,7 @@ export async function runAOT(
 ): Promise<ConditionResult> {
   return runAOTVariant(
     task, adapter, adapterConfig, skillContent, skillId, skillPath,
-    tcp, compilerProvider, "aot-compiled", [1, 2, 3], evaluatorConfig, convLog, evalOptions,
+    tcp, compilerProvider, "aot-compiled", [1, 2, 3], undefined, evaluatorConfig, convLog, evalOptions,
   )
 }
 
@@ -623,6 +636,7 @@ export async function runJITBoost(
   skillId: string,
   skillDir: string,
   jitRuns: number,
+  skillMode?: SkillMode,
   evaluatorConfig?: EvaluatorConfig,
   convLogDir?: string,
   cliTimeoutMs?: number,
@@ -639,6 +653,12 @@ export async function runJITBoost(
   const jitRunReports: JitRunReport[] = []
   let lastRunResult: RunResult | null = null
   const outputDir = getJitBoostDir(skillId)
+
+  const jitBoostSkillBundle = buildSkillBundleFromContent(
+    skillContent,
+    parseSkillMeta(skillContent, skillDir),
+    skillMode,
+  )
 
   // -----------------------------------------------------------------------
   // Step 1: Warmup run (no hooks) — collect conv log of actual agent code
@@ -664,7 +684,7 @@ export async function runJITBoost(
       const runResult = await adapter.run({
         prompt: task.prompt,
         workDir,
-        skillContent,
+        skill: jitBoostSkillBundle,
         convLog,
         timeoutMs: adapterConfig.timeoutMs,
       })
@@ -774,7 +794,7 @@ export async function runJITBoost(
       const runResult = await adapter.run({
         prompt: task.prompt,
         workDir,
-        skillContent,
+        skill: jitBoostSkillBundle,
         convLog,
         timeoutMs: adapterConfig.timeoutMs,
       })
@@ -864,6 +884,7 @@ export async function runCustomSkill(
   adapterConfig: AdapterConfig,
   conditionLabel: string,
   skillDir: string,
+  skillMode?: SkillMode,
   evaluatorConfig?: EvaluatorConfig,
   convLog?: ConversationLog,
   evalOptions?: EvaluateAllOptions,
@@ -889,6 +910,8 @@ export async function runCustomSkill(
     }
   } catch { /* no bundle files */ }
 
+  const customSkillMeta = parseSkillMeta(skillContent, skillDir)
+
   try {
     const result = await runTask({
       task,
@@ -896,7 +919,7 @@ export async function runCustomSkill(
       adapterConfig,
       evaluatorConfig,
       convLog,
-      skillContent,
+      skill: buildSkillBundleFromContent(skillContent, customSkillMeta, skillMode),
       workDir,
       keepWorkDir: true,
       evalOptions,

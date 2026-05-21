@@ -6,7 +6,7 @@
  */
 
 import { z } from "zod"
-import type { AdapterConfig, EvalResult, EvalCriterion, TokenUsage, RunStatus } from "../core/types.ts"
+import type { AdapterConfig, EvalResult, EvalCriterion, TokenUsage, RunStatus, SkillMode } from "../core/types.ts"
 import { addTokenUsage, TokenUsageSchema } from "../core/types.ts"
 import type { LLMProvider } from "../providers/types.ts"
 import type { AgentAdapter } from "../core/types.ts"
@@ -284,7 +284,7 @@ export interface OptimizeConfig {
   /** Directory to persist the optimizer conversation log */
   logDir?: string
   /** Headless agent driver to use; defaults to the system default */
-  driver?: import("../core/headless-agent.ts").HeadlessAgentDriver
+  driver?: import("../core/headless-agent/index.ts").HeadlessAgentDriver
 }
 
 /**
@@ -522,6 +522,12 @@ export interface JitOptimizeConfig {
    * `TIMEOUT_DEFAULTS.syntheticTaskExec` (300 000 ms).
    */
   taskExecTimeoutMs?: number
+  /**
+   * How the optimized skill should be loaded into each per-task adapter
+   * run. Defaults to CLI_DEFAULTS.skillMode ("inject") via buildSkillBundle
+   * when omitted.
+   */
+  skillMode?: SkillMode
 }
 
 // ---------------------------------------------------------------------------
