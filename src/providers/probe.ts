@@ -5,7 +5,7 @@
  * (auto-probe.ts). Splitting these out keeps the LLM-touching probe call
  * independently testable from the wrapper's retry orchestration.
  *
- * Spec: docs/skvm/2026-05-19-provider-auto-probe.md (Section "Verdict mapping").
+ * See issue #26 for background.
  */
 import type { LLMProvider, LLMToolCall } from "./types.ts"
 import { isToolArgumentsParseError } from "./errors.ts"

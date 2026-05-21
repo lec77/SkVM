@@ -116,6 +116,41 @@ describe("AutoProbeProvider", () => {
     expect(altToolResultCalls).toBe(1)
   })
 
+  test("writeRoute throws: still retries via alt (no crash), sticky-bind survives for next call", async () => {
+    let altCompleteCalls = 0
+    const alt: LLMProvider = {
+      name: "alt",
+      complete: async () => {
+        altCompleteCalls += 1
+        return { text: "from-alt", toolCalls: [], tokens: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0 }, durationMs: 0, stopReason: "end_turn" as const }
+      },
+      completeWithToolResults: async () => ({
+        text: "from-alt-results", toolCalls: [], tokens: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0 }, durationMs: 0, stopReason: "end_turn" as const,
+      }),
+    } as unknown as LLMProvider
+    const delegate: LLMProvider = {
+      name: "delegate",
+      complete: async () => { throw new ToolArgumentsParseError("delegate", "<think>x</think>{}") },
+    } as unknown as LLMProvider
+    const route: ProviderRoute = { match: "x/*", kind: "openai-compatible", baseUrl: "https://x.example.com/v1", apiKey: "k" }
+
+    const wrapper = new AutoProbeProvider(delegate, "x/m", route, async () => ({
+      verdict: { primary: "polluted", alt: "clean" },
+      altProvider: alt,
+      writeRoute: async () => { throw new Error("disk full") },
+    }))
+
+    // First call: writeRoute throws but complete() must still return alt's result.
+    const res = await wrapper.complete({ messages: [{ role: "user", content: "hi" }] })
+    expect(res.text).toBe("from-alt")
+    expect(altCompleteCalls).toBe(1)
+
+    // Second call: sticky-bind is active; delegate is never reached again.
+    const res2 = await wrapper.complete({ messages: [{ role: "user", content: "second" }] })
+    expect(res2.text).toBe("from-alt")
+    expect(altCompleteCalls).toBe(2)
+  })
+
   test("guard set prevents re-probing the same modelId in same process", async () => {
     let probeRuns = 0
     const delegate: LLMProvider = {

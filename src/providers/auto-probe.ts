@@ -37,7 +37,7 @@ export type ProbeOrchestrator = (modelId: string, route: ProviderRoute) => Promi
  * real network or config file. `createProviderForModel` wires it to the
  * concrete `runProbe` + `appendDiscoveredRoute` implementation.
  *
- * Spec: docs/skvm/2026-05-19-provider-auto-probe.md
+ * See issue #26 for background.
  */
 export class AutoProbeProvider implements LLMProvider {
   readonly name: string
@@ -68,10 +68,15 @@ export class AutoProbeProvider implements LLMProvider {
       log.info(`auto-probe verdict: primary=${probed.verdict.primary} alt=${probed.verdict.alt ?? "-"}`)
 
       if (probed.altProvider && probed.writeRoute) {
-        const writeResult = await probed.writeRoute()
-        log.info(`auto-probe route ${writeResult.written ? "written" : "already present"} for ${this.modelId}`)
-        // Sticky-bind so that subsequent complete() and completeWithToolResults() calls go through alt.
+        // Sticky-bind before the write attempt so the alt is used for this
+        // session even if persistence fails.
         this.altProvider = probed.altProvider
+        try {
+          const writeResult = await probed.writeRoute()
+          log.info(`auto-probe route ${writeResult.written ? "written" : "already present"} for ${this.modelId}`)
+        } catch (writeErr) {
+          log.warn(`auto-probe could not persist route for ${this.modelId} (continuing with alt for this session): ${writeErr}`)
+        }
         return this.altProvider.complete(params)
       }
       // No clean alternative; let the original error propagate.
