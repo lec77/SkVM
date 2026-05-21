@@ -10,6 +10,26 @@ import { runProbe, inferAnthropicBaseUrl } from "./probe.ts"
 import { appendDiscoveredRoute } from "../core/config-write.ts"
 
 /**
+ * Return true only when `baseUrl` is the exact official Anthropic API host.
+ * Uses `new URL()` to parse the hostname, which prevents substring-match
+ * bypasses like `https://notapi.anthropic.com.evil.com`.
+ *
+ * Returns `false` when the URL is unparseable — we treat an unrecognisable
+ * gateway as non-official, which skips the `claude-` prefix check. That
+ * matches the existing intent: the prefix guard is only for the real
+ * Anthropic backend, not arbitrary custom gateways.
+ */
+function isOfficialAnthropicUrl(baseUrl: string): boolean {
+  try {
+    return new URL(baseUrl).hostname === "api.anthropic.com"
+  } catch {
+    // Unparseable URL: treat as non-official so we don't accidentally
+    // enforce the claude- prefix on a custom gateway.
+    return false
+  }
+}
+
+/**
  * Built-in fallback route. Applied when `providers.routes` is empty or no
  * user route matches a given model id. Catches `openrouter/...` ids without
  * forcing the user to configure a route explicitly — other prefixes still
@@ -86,7 +106,7 @@ export function validateModelIdForRoute(modelId: string, route: ProviderRoute): 
       // non-Anthropic-vendor models whose ids do not start with "claude-"
       // (glm-5-thinking, minimax-m2.5, etc.). Skip the prefix check when a
       // custom baseUrl is configured and it is not api.anthropic.com.
-      const isOfficial = !route.baseUrl || /api\.anthropic\.com/.test(route.baseUrl)
+      const isOfficial = !route.baseUrl || isOfficialAnthropicUrl(route.baseUrl)
       if (isOfficial && !/^claude-/i.test(bare)) {
         throw new Error(
           `Model id "${modelId}" doesn't look like an Anthropic model. ` +
@@ -124,9 +144,11 @@ export function createProviderForModel(
   const route = resolveRoute(modelId)
   const delegate = instantiate(modelId, route, overrides)
 
-  // Auto-probe is gated to openai-compatible routes; the other kinds can't
-  // produce ToolArgumentsParseError (anthropic returns structured input;
-  // openrouter normalizes reasoning fields).
+  // Auto-probe is gated to openai-compatible routes. The alternative endpoint
+  // that auto-probe synthesises is an Anthropic-shaped URL on the same host
+  // (e.g. /v1 → /v1/messages). That synthesis only makes sense when the
+  // primary route is an openai-compatible gateway; anthropic and openrouter
+  // routes have no such Anthropic-shaped alternative to discover.
   if (route.kind !== "openai-compatible") return delegate
 
   // Opt-out: env var, then check that auto-probe is even applicable here.

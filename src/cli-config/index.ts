@@ -38,6 +38,7 @@ import {
   getDefaultAdapterConfigMode,
   detectLegacyHeadlessFields,
   invalidateConfigCache,
+  resolveConfigWritePath,
 } from "../core/config.ts"
 import type { ProviderKind, ProviderRoute, AdapterConfigMode } from "../core/types.ts"
 import { appendDiscoveredRoute } from "../core/config-write.ts"
@@ -347,7 +348,7 @@ function smokeTestModelId(routes: readonly RouteDraft[]): string {
 const MAX_CONFIG_BACKUPS = 5
 
 function pruneOldConfigBackups(): number {
-  const configPath = getConfigWritePath()
+  const configPath = resolveConfigWritePath()
   const dir = path.dirname(configPath)
   const prefix = `${path.basename(configPath)}.bak.`
   let entries: string[]
@@ -1427,16 +1428,6 @@ function printHeader(title: string): void {
 // which has no prompt or cli-config dependencies.
 export { appendDiscoveredRoute } from "../core/config-write.ts"
 
-/**
- * The path skvm writes its config to, derived fresh at call time so callers
- * that set SKVM_CACHE after module load (e.g. tests) see the correct path.
- */
-function getConfigWritePath(): string {
-  const cacheRoot = process.env.SKVM_CACHE
-    ? path.resolve(process.env.SKVM_CACHE)
-    : path.join(process.env.HOME ?? "~", ".skvm")
-  return path.join(cacheRoot, "skvm.config.json")
-}
 
 function serialize(draft: ConfigDraft): string {
   // Drop empty optional fields so the output stays minimal.
@@ -1479,7 +1470,7 @@ function serialize(draft: ConfigDraft): string {
 // ---------------------------------------------------------------------------
 
 function runProbesList(): void {
-  const configPath = getConfigWritePath()
+  const configPath = resolveConfigWritePath()
   if (!existsSync(configPath)) {
     console.log(c.dim("No auto-discovered routes."))
     return
@@ -1505,7 +1496,7 @@ function runProbesList(): void {
 }
 
 async function runProbesClear(pattern: string | undefined): Promise<void> {
-  const configPath = getConfigWritePath()
+  const configPath = resolveConfigWritePath()
   const lockPath = `${configPath}.lock`
   await withFileLock(lockPath, { timeoutMs: 5_000 }, async () => {
     if (!existsSync(configPath)) {
@@ -1529,6 +1520,7 @@ async function runProbesClear(pattern: string | undefined): Promise<void> {
     draft.providers.routes = remaining
     writeFileSync(configPath, JSON.stringify(draft, null, 2) + "\n")
     try { chmodSync(configPath, 0o600) } catch { /* best-effort */ }
+    invalidateConfigCache()
     console.log(c.green(`✓ Removed ${before - remaining.length} auto-discovered route(s).`))
   })
 }

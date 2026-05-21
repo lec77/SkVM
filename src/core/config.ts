@@ -288,12 +288,24 @@ let _configPath: string | undefined
 /**
  * Derive the skvm.config.json path under the current SKVM_CACHE root.
  * Re-reads `process.env.SKVM_CACHE` at call time so test code that
- * overrides the env var between calls sees the updated path.
+ * overrides the env var between calls sees the updated path. When
+ * `SKVM_CACHE` is not set, falls back to `~/.skvm/` resolved via
+ * `expandHome` (which uses `process.env.HOME` with an empty-string
+ * fallback, consistent with the rest of the cache-root logic).
+ *
+ * Exported so callers that need to write or probe the config path at
+ * runtime (e.g. cli-config's `probes clear`) don't have to re-derive
+ * it independently and risk inconsistency.
  */
-function currentConfigWritePath(): string {
+export function resolveConfigWritePath(): string {
   const env = process.env.SKVM_CACHE
   if (env) return path.join(path.resolve(env), "skvm.config.json")
   return CONFIG_WRITE_PATH
+}
+
+/** @internal alias kept for in-file callers */
+function currentConfigWritePath(): string {
+  return resolveConfigWritePath()
 }
 
 /**

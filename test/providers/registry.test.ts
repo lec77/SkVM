@@ -221,6 +221,19 @@ describe("validateModelIdForRoute on anthropic kind", () => {
     expect(() => validateModelIdForRoute("gw_anthropic/glm-5-thinking", route))
       .not.toThrow()
   })
+
+  test("accepts non-claude id when baseUrl looks like api.anthropic.com but is a subdomain spoof", () => {
+    // The old substring regex /api\.anthropic\.com/ would have matched this URL,
+    // causing the prefix check to fire and reject the model. With exact hostname
+    // comparison via new URL(), the spoof hostname differs from "api.anthropic.com"
+    // and the prefix check is correctly skipped for this third-party gateway.
+    const route: ProviderRoute = {
+      match: "evil/*", kind: "anthropic",
+      baseUrl: "https://notapi.anthropic.com.evil.com", apiKey: "k",
+    }
+    expect(() => validateModelIdForRoute("evil/glm-5-thinking", route))
+      .not.toThrow()
+  })
 })
 
 // ---------------------------------------------------------------------------
