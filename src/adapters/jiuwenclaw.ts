@@ -18,19 +18,22 @@ const log = createLogger("jiuwenclaw")
 // Sidecar lifecycle constants
 // ---------------------------------------------------------------------------
 //
-// Jiuwenclaw's AgentServer reads its LLM credentials and target model from
-// ~/.jiuwenclaw/config/.env at *startup* (jiuwenclaw/app.py → load_dotenv →
-// resources/config.yaml ${API_BASE}/${API_KEY}/${MODEL_NAME}/${MODEL_PROVIDER}).
-// There is no per-request model override — the ACP session/prompt request only
-// carries `content`. So each target model needs its own sidecar launched with
-// its own .env.
+// Jiuwenclaw (renamed jiuwenswarm upstream) AgentServer reads its LLM
+// credentials and target model from ~/.jiuwenswarm/config/.env at *startup*
+// (jiuwenswarm/app.py → load_dotenv → resources/config.yaml
+// ${API_BASE}/${API_KEY}/${MODEL_NAME}/${MODEL_PROVIDER}). There is no
+// per-request model override — the ACP session/prompt request only carries
+// `content`. So each target model needs its own sidecar launched with its
+// own .env.
 //
-// Port 19001 and ~/.jiuwenclaw/config/.env are both user-global singletons, so
-// at most one sidecar may live at a time across all processes on the host. We
-// enforce that with a cross-process file lock (reused from openclaw's pattern).
+// Port 19001 and ~/.jiuwenswarm/config/.env are both user-global singletons,
+// so at most one sidecar may live at a time across all processes on the host.
+// We enforce that with a cross-process file lock (reused from openclaw's
+// pattern). The SkVM adapter name stays `jiuwenclaw` for stable CLI / cache /
+// proposals paths even though the upstream package was renamed.
 
 const HOME = process.env.HOME ?? ""
-const JIUWEN_DIR = path.join(HOME, ".jiuwenclaw")
+const JIUWEN_DIR = path.join(HOME, ".jiuwenswarm")
 const JIUWEN_ENV_PATH = path.join(JIUWEN_DIR, "config", ".env")
 const JIUWEN_ENV_BACKUP = path.join(JIUWEN_DIR, "config", ".env.skvm-backup")
 const JIUWEN_LOCK_PATH = path.join(JIUWEN_DIR, "jiuwenclaw.sidecar.lock")
@@ -56,12 +59,12 @@ const SIDECAR_SHUTDOWN_TIMEOUT_MS = 15_000
 // ---------------------------------------------------------------------------
 
 /**
- * A single record in ~/.jiuwenclaw/agent/sessions/{session_id}/history.json.
+ * A single record in ~/.jiuwenswarm/agent/sessions/{session_id}/history.json.
  *
  * Upstream writes per-event fields directly on the record (flat shape); the
  * fields below are populated based on `event_type`. See
- * jiuwenclaw/agentserver/session_history.py and
- * jiuwenclaw/agentserver/deep_agent/interface_deep.py for the write logic.
+ * jiuwenswarm/server/runtime/session/session_history.py and
+ * jiuwenswarm/server/runtime/agent_adapter/interface_deep.py for the write logic.
  */
 interface HistoryRecord {
   id: string
@@ -202,34 +205,37 @@ export function parseJiuwenClawHistory(
 // ---------------------------------------------------------------------------
 
 /**
- * Resolve jiuwenclaw-cli command.
- * Priority: custom path from skvm.config.json → globally installed `jiuwenclaw-cli`.
+ * Resolve the ACP stdio bridge command (upstream renamed `jiuwenclaw-cli` to
+ * `jiuwenswarm-tui`; new module path is `jiuwenswarm.channels.acp.app_acp`).
+ * Priority: custom path from skvm.config.json → globally installed binary.
  */
 export async function resolveJiuwenClawCmd(): Promise<string[]> {
-  // 1. Custom path from config — run via python3 -m jiuwenclaw.app_cli
+  // 1. Custom path from config — run via python3 -m jiuwenswarm.channels.acp.app_acp
   const repoDir = getAdapterRepoDir("jiuwenclaw")
   if (repoDir) {
-    const mainModule = path.join(repoDir, "jiuwenclaw", "app_cli.py")
+    const mainModule = path.join(repoDir, "jiuwenswarm", "channels", "acp", "app_acp.py")
     if (await Bun.file(mainModule).exists()) {
-      log.info(`Using jiuwenclaw from source: ${repoDir}`)
-      return ["python3", "-m", "jiuwenclaw.app_cli"]
+      log.info(`Using jiuwenswarm from source: ${repoDir}`)
+      return ["python3", "-m", "jiuwenswarm.channels.acp.app_acp"]
     }
-    throw new Error(`jiuwenclaw not found at ${repoDir} (no jiuwenclaw/app_cli.py)`)
+    throw new Error(
+      `jiuwenswarm not found at ${repoDir} (no jiuwenswarm/channels/acp/app_acp.py)`,
+    )
   }
 
   // 2. Global install
-  const { exitCode, stdout } = await runCommandWithEnv(["which", "jiuwenclaw-cli"])
+  const { exitCode, stdout } = await runCommandWithEnv(["which", "jiuwenswarm-tui"])
   if (exitCode === 0 && stdout.trim()) {
-    log.info(`Using global jiuwenclaw-cli: ${stdout.trim()}`)
+    log.info(`Using global jiuwenswarm-tui: ${stdout.trim()}`)
     return [stdout.trim()]
   }
   throw new Error(
-    "jiuwenclaw-cli not found. Either install it globally or set adapters.jiuwenclaw in skvm.config.json",
+    "jiuwenswarm-tui not found. Either install it globally or set adapters.jiuwenclaw in skvm.config.json",
   )
 }
 
 /**
- * Resolve the python interpreter that should run `python3 -m jiuwenclaw.app`.
+ * Resolve the python interpreter that should run `python3 -m jiuwenswarm.app`.
  *
  * For source-checkout mode (`repoDir` set), `cmdPrefix[0]` is the literal
  * string "python3" — fall back to PATH resolution because `run()` already
@@ -237,7 +243,7 @@ export async function resolveJiuwenClawCmd(): Promise<string[]> {
  * here.
  *
  * For global-install mode, `cliFirstArg` is the absolute path to the
- * `jiuwenclaw-cli` script, which is a Python entry-point with a shebang
+ * `jiuwenswarm-tui` script, which is a Python entry-point with a shebang
  * pointing at the venv interpreter (true for venv, virtualenv, pipx, and
  * any pip-installed setup). Use that interpreter directly so the sidecar
  * never depends on whether the active PATH happens to expose the same venv.
@@ -256,7 +262,7 @@ async function resolveSidecarPython(
   // Try shebang first (handles `#!/abs/path/python` and `#!/usr/bin/env python3`).
   // Only trust the shebang if its interpreter actually looks like a Python —
   // a `#!/bin/sh` wrapper script that activates a venv before exec'ing the
-  // real CLI would otherwise leave us trying to run `/bin/sh -m jiuwenclaw.app`.
+  // real CLI would otherwise leave us trying to run `/bin/sh -m jiuwenswarm.app`.
   try {
     const head = await Bun.file(cliFirstArg).text()
     const firstLine = head.split("\n", 1)[0] ?? ""
@@ -331,7 +337,7 @@ export class JiuwenClawAdapter implements AgentAdapter {
         "jiuwenclaw does not support --adapter-config=native: its set_user_home() Python API " +
         "only scopes config for the in-process Python side, not for the subprocess AgentServer " +
         "+ gateway sidecars. Use --adapter-config=managed (or set defaults.adapterConfigMode=managed " +
-        "in skvm.config.json) — skvm writes a minimal ~/.jiuwenclaw/config/.env from providers.routes " +
+        "in skvm.config.json) — skvm writes a minimal ~/.jiuwenswarm/config/.env from providers.routes " +
         "and backs up / restores the user's .env around the run.",
       )
     }
@@ -349,7 +355,7 @@ export class JiuwenClawAdapter implements AgentAdapter {
         staleMs: JIUWEN_LOCK_STALE_MS,
         timeoutMs: JIUWEN_LOCK_ACQUIRE_TIMEOUT_MS,
         heartbeatMs: JIUWEN_LOCK_HEARTBEAT_MS,
-        // jiuwenclaw.app leaves app_agentserver + app_gateway as independent
+        // jiuwenswarm.app leaves app_agentserver + app_gateway as independent
         // children that outlive the wrapper pid, so releasing the lock on
         // abnormal parent exit would let another skvm process acquire while
         // the orphans still own port 19001 and the adapter-owned .env. Hold
@@ -425,7 +431,7 @@ export class JiuwenClawAdapter implements AgentAdapter {
     ]
 
     // Build env with PYTHONPATH for source installs. Model routing lives in
-    // ~/.jiuwenclaw/config/.env (rewritten by setup()) and is read by the
+    // ~/.jiuwenswarm/config/.env (rewritten by setup()) and is read by the
     // long-running sidecar, not the short-lived ACP stdio client below.
     const env: Record<string, string | undefined> = { ...process.env }
     if (this.repoDir) {
@@ -556,7 +562,7 @@ export class JiuwenClawAdapter implements AgentAdapter {
     if (skillLoaded !== undefined) {
       result.skillLoaded = skillLoaded
     }
-    // jiuwenclaw's app_cli + acp_channel log INFO messages to stderr as a
+    // jiuwenswarm's app_acp + acp_connect log INFO messages to stderr as a
     // matter of course (e.g. "[CLI] starting ACP stdio gateway"), so we can't
     // treat a non-empty stderr as a failure. Only exitCode != 0 is a real
     // error — the parsed RunResult is authoritative.
@@ -678,7 +684,7 @@ export class JiuwenClawAdapter implements AgentAdapter {
     if (await tcpProbe(GATEWAY_HOST, GATEWAY_PORT)) {
       log.warn(`jiuwenclaw port ${GATEWAY_PORT} already in use; killing orphan sidecar`)
       try {
-        const killProc = Bun.spawn(["pkill", "-f", "jiuwenclaw\\.app"], { stdout: "pipe", stderr: "pipe" })
+        const killProc = Bun.spawn(["pkill", "-f", "jiuwenswarm\\.app"], { stdout: "pipe", stderr: "pipe" })
         await killProc.exited
       } catch { /* ignore */ }
       // Wait up to 5s for the port to actually release.
@@ -689,7 +695,7 @@ export class JiuwenClawAdapter implements AgentAdapter {
       }
       if (await tcpProbe(GATEWAY_HOST, GATEWAY_PORT)) {
         throw new Error(
-          `jiuwenclaw port ${GATEWAY_PORT} still in use after pkill — please kill jiuwenclaw.app manually`,
+          `jiuwenclaw port ${GATEWAY_PORT} still in use after pkill — please kill jiuwenswarm.app manually`,
         )
       }
       log.info(`jiuwenclaw orphan sidecar cleared from port ${GATEWAY_PORT}`)
@@ -697,8 +703,8 @@ export class JiuwenClawAdapter implements AgentAdapter {
 
     // repoDir is optional: when the user configured a source checkout we use
     // it as both cwd and PYTHONPATH; when only a venv-installed
-    // `jiuwenclaw-cli` is available, `python3 -m jiuwenclaw.app` resolves from
-    // site-packages and cwd doesn't matter.
+    // `jiuwenswarm-tui` is available, `python3 -m jiuwenswarm.app` resolves
+    // from site-packages and cwd doesn't matter.
     const env: Record<string, string> = {}
     for (const [k, v] of Object.entries(process.env)) {
       if (typeof v === "string") env[k] = v
@@ -710,8 +716,8 @@ export class JiuwenClawAdapter implements AgentAdapter {
     if (this.apiKey) env.OPENROUTER_API_KEY = this.apiKey
 
     const cwd = this.repoDir ?? process.cwd()
-    log.info(`jiuwenclaw spawning sidecar: ${this.sidecarPython} -m jiuwenclaw.app (cwd=${cwd})`)
-    const proc = Bun.spawn([this.sidecarPython, "-m", "jiuwenclaw.app"], {
+    log.info(`jiuwenclaw spawning sidecar: ${this.sidecarPython} -m jiuwenswarm.app (cwd=${cwd})`)
+    const proc = Bun.spawn([this.sidecarPython, "-m", "jiuwenswarm.app"], {
       cwd,
       stdout: "pipe",
       stderr: "pipe",
@@ -762,14 +768,14 @@ export class JiuwenClawAdapter implements AgentAdapter {
       }
     }
 
-    // jiuwenclaw/app.py's main() Popens app_agentserver + app_gateway as
+    // jiuwenswarm/app.py's main() Popens app_agentserver + app_gateway as
     // independent children, and only runs its `_terminate_all()` finally block
     // on KeyboardInterrupt — not on SIGTERM. So killing the orchestrator
     // reliably leaves its two children orphaned. We own the sidecar lock, so
-    // sweep any remaining jiuwenclaw.app* processes and wait for the port to
+    // sweep any remaining jiuwenswarm.app* processes and wait for the port to
     // clear.
     try {
-      const killProc = Bun.spawn(["pkill", "-f", "jiuwenclaw\\.app"], { stdout: "pipe", stderr: "pipe" })
+      const killProc = Bun.spawn(["pkill", "-f", "jiuwenswarm\\.app"], { stdout: "pipe", stderr: "pipe" })
       await killProc.exited
     } catch { /* ignore */ }
 
@@ -889,7 +895,7 @@ function pumpToLogger(stream: ReadableStream<Uint8Array> | null, tag: string): v
 // ---------------------------------------------------------------------------
 //
 // If the SkVM process is interrupted mid-run, best-effort kill the sidecar
-// and restore ~/.jiuwenclaw/config/.env so the user's config isn't left in
+// and restore ~/.jiuwenswarm/config/.env so the user's config isn't left in
 // an adapter-owned state. The file lock already auto-releases on process exit
 // (see src/core/file-lock.ts); this hook only handles the sidecar + .env.
 
