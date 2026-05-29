@@ -572,6 +572,21 @@ export class JiuwenClawAdapter implements AgentAdapter {
     if (timedOut) {
       result.runStatus = "timeout"
       result.statusDetail = `jiuwenclaw subprocess killed after ${task.timeoutMs ?? this.timeoutMs}ms`
+      // runCommandWithEnv group-killed the ACP client tree, but the long-lived
+      // sidecar's AgentServer keeps running the (possibly runaway) session —
+      // it is a separate process tree, not the client's child, so the client
+      // timeout alone does not stop the server-side work. Without this, a
+      // degenerate run (observed: 1200+ tool calls looping on memory lookups)
+      // keeps burning API quota and can poison the next run sharing this
+      // sidecar. Restart it to abort the session cleanly.
+      log.warn("jiuwenclaw timed out; restarting sidecar to abort the server-side session")
+      try {
+        await this.stopSidecar()
+        await this.startSidecar()
+        result.statusDetail += " (sidecar restarted to clear the session)"
+      } catch (err) {
+        log.warn(`jiuwenclaw sidecar restart after timeout failed: ${(err as Error).message}`)
+      }
     } else if (exitCode !== 0) {
       result.runStatus = "adapter-crashed"
       result.statusDetail = `jiuwenclaw exited with code ${exitCode}`
@@ -684,7 +699,7 @@ export class JiuwenClawAdapter implements AgentAdapter {
     if (await tcpProbe(GATEWAY_HOST, GATEWAY_PORT)) {
       log.warn(`jiuwenclaw port ${GATEWAY_PORT} already in use; killing orphan sidecar`)
       try {
-        const killProc = Bun.spawn(["pkill", "-f", "jiuwenswarm\\.app"], { stdout: "pipe", stderr: "pipe" })
+        const killProc = Bun.spawn(["pkill", "-f", "jiuwenswarm\\.(app|server\\.app_agentserver|gateway\\.app_gateway)"], { stdout: "pipe", stderr: "pipe" })
         await killProc.exited
       } catch { /* ignore */ }
       // Wait up to 5s for the port to actually release.
@@ -775,7 +790,7 @@ export class JiuwenClawAdapter implements AgentAdapter {
     // sweep any remaining jiuwenswarm.app* processes and wait for the port to
     // clear.
     try {
-      const killProc = Bun.spawn(["pkill", "-f", "jiuwenswarm\\.app"], { stdout: "pipe", stderr: "pipe" })
+      const killProc = Bun.spawn(["pkill", "-f", "jiuwenswarm\\.(app|server\\.app_agentserver|gateway\\.app_gateway)"], { stdout: "pipe", stderr: "pipe" })
       await killProc.exited
     } catch { /* ignore */ }
 
