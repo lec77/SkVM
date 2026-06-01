@@ -1,4 +1,4 @@
-import { mkdir, copyFile, writeFile, unlink, readdir, stat } from "node:fs/promises"
+import { mkdir, copyFile, writeFile, unlink, readdir, stat, realpath } from "node:fs/promises"
 import { existsSync } from "node:fs"
 import path from "node:path"
 import net from "node:net"
@@ -393,12 +393,26 @@ export class JiuwenClawAdapter implements AgentAdapter {
     timeoutMs?: number
   }): Promise<RunResult> {
     let skillLoaded: boolean | undefined
+
+    // Resolve symlinks (macOS mkdtemp hands back /var/folders/... which is a
+    // symlink to /private/var/folders/...). jiuwenswarm scopes the agent's
+    // workspace by passing --workspace-dir through Path.resolve(), so its
+    // fs_operation sandbox checks writes against the *realpath*. If we hand the
+    // agent the raw /var/... path in the hint and --workspace-dir, any
+    // ABSOLUTE path it writes (/var/...) fails the membership check against the
+    // resolved workspace (/private/var/...) and the write is silently dropped
+    // (empty tool result, no file). Relative paths happen to work because they
+    // resolve against the already-resolved cwd — but models that emit absolute
+    // paths from the hint then score 0 on every file-output task. Resolve once
+    // so the hint, --workspace-dir, and the agent's absolute paths all agree.
+    const workDir = await realpath(task.workDir).catch(() => task.workDir)
+
     let prompt = `IMPORTANT: Do not ask clarifying questions. Proceed directly with implementation. Execute all steps immediately without waiting for user input.\n\n`
 
     // Filesystem tools resolve relative paths against sys_operation.work_dir
-    // (mutated to task.workDir via --workspace-dir below); the hint nudges
-    // the model to use them instead of hard-coding home-dir paths.
-    prompt += `Your working directory is ${task.workDir}. Use relative paths (or absolute paths under that directory) for all file operations.\n\n`
+    // (scoped to workDir via --workspace-dir below); the hint nudges the model
+    // to use them instead of hard-coding home-dir paths.
+    prompt += `Your working directory is ${workDir}. Use relative paths (or absolute paths under that directory) for all file operations.\n\n`
 
     // --- Skill handling ---
     if (task.skill) {
@@ -426,7 +440,7 @@ export class JiuwenClawAdapter implements AgentAdapter {
       ...this.cmdPrefix,
       "acp",
       "--session-id", sessionId,
-      "--workspace-dir", task.workDir,
+      "--workspace-dir", workDir,
       prompt,
     ]
 
@@ -442,7 +456,7 @@ export class JiuwenClawAdapter implements AgentAdapter {
     }
 
     const { stdout, stderr, exitCode, timedOut } = await runCommandWithEnv(cmd, {
-      cwd: task.workDir,
+      cwd: workDir,
       timeout: task.timeoutMs ?? this.timeoutMs,
       env,
     })
@@ -504,14 +518,14 @@ export class JiuwenClawAdapter implements AgentAdapter {
       }
       try {
         const historyData = JSON.parse(text) as HistoryRecord[]
-        result = parseJiuwenClawHistory(historyData, task.workDir, durationMs)
+        result = parseJiuwenClawHistory(historyData, workDir, durationMs)
         usedHistoryPath = candidate
         usedHistoryText = text
         log.debug(`Parsed ${historyData.length} history records from ${candidate}`)
         break
       } catch (err) {
         log.warn(`Failed to parse jiuwenclaw history.json at ${candidate}: ${err}`)
-        result = buildMinimalResult(responseText, task.workDir, durationMs, "ok",
+        result = buildMinimalResult(responseText, workDir, durationMs, "ok",
           `jiuwenclaw history.json invalid: ${String(err).slice(0, 200)} — telemetry unavailable, workDir scored as-is`)
         usedHistoryPath = candidate
         break
@@ -519,7 +533,7 @@ export class JiuwenClawAdapter implements AgentAdapter {
     }
     if (!result) {
       log.debug(`No history.json near ${candidates[0]}, using JSON-RPC response only`)
-      result = buildMinimalResult(responseText, task.workDir, durationMs, "ok",
+      result = buildMinimalResult(responseText, workDir, durationMs, "ok",
         `jiuwenclaw history.json not written for session ${responseSessionId} — telemetry unavailable, workDir scored as-is`)
     }
 
