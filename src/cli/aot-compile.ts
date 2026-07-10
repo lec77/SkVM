@@ -67,6 +67,15 @@ export async function runCompile(config: CompileConfig): Promise<void> {
   const passes: string[] = config.pass
     ? config.pass.split(",").map((p) => p.trim()).filter(Boolean)
     : CLI_DEFAULTS.compilerPasses.map(String)
+  // A provided --pass that yields zero tokens (e.g. `--pass=,`) must not fall
+  // through: `needsTcp` below would see "no passes" while compileSkill treats
+  // an empty list as "use the default passes", which do require a TCP.
+  if (config.pass && passes.length === 0) {
+    throw new UsageError(
+      "aot-compile: --pass contains no pass tokens. Run 'skvm aot-compile --list-passes' to see available passes.",
+      COMPILE_FLAGS.help,
+    )
+  }
   const concurrency = config.concurrency
   const dryRun = config["dry-run"]
 

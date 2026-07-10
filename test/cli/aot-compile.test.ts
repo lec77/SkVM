@@ -136,6 +136,19 @@ describe("runCompile — cross-flag rules", () => {
     )
   })
 
+  test("--pass with zero tokens is a UsageError before any side effect", async () => {
+    // `--pass=,` parses to zero tokens. Without this gate the CLI would skip
+    // profile loading (no pass requires a TCP) while compileSkill falls back
+    // to the default passes (which do), failing per-job with a misleading
+    // message. Thrown before skill resolution: the bogus ./s path is never
+    // touched.
+    for (const argv of ["--pass=,", "--pass= , ,"]) {
+      expect((await runError(["--skill=./s", "--model=x/y", argv])).message).toBe(
+        "aot-compile: --pass contains no pass tokens. Run 'skvm aot-compile --list-passes' to see available passes.",
+      )
+    }
+  })
+
   test("--pass without a TCP consumer skips profile loading entirely", async () => {
     const { mkdtempSync } = await import("node:fs")
     const { tmpdir } = await import("node:os")
