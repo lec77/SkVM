@@ -89,6 +89,7 @@ async function runLevel(
   let skipCount = 0
   let totalDurationMs = 0
   let totalCostUsd = 0
+  let totalTokens = emptyTokenUsage()
 
   for (let i = 0; i < instanceCount; i++) {
     const inst = generator.generate(level)
@@ -97,6 +98,8 @@ async function runLevel(
     if (result.skipped) skipCount++
     else if (result.passed) passCount++
     totalDurationMs += result.durationMs
+    totalCostUsd += result.costUsd
+    totalTokens = addTokenUsage(totalTokens, result.tokens)
   }
 
   // A level passes when every instance that actually ran passed. Skipped
@@ -113,6 +116,7 @@ async function runLevel(
     instances,
     durationMs: totalDurationMs,
     costUsd: totalCostUsd,
+    tokens: totalTokens,
   }
 }
 
@@ -136,6 +140,10 @@ async function runInstance(
   const startMs = performance.now()
   let passed = false
   let skipped = false
+  // Billing carried on every return path — money spent on a tainted or
+  // skipped run is still money spent.
+  let costUsd = 0
+  let tokens = emptyTokenUsage()
 
   // Create per-instance conversation log and save eval script if convLogDir is set
   let convLog: ConversationLog | undefined
@@ -161,6 +169,8 @@ async function runInstance(
 
     // Run agent and write response.txt for eval scripts
     const runResult = await adapter.run({ prompt: inst.prompt, workDir, taskId: `${primitiveId}-${level}-${index}`, convLog })
+    costUsd = runResult.cost
+    tokens = runResult.tokens
     await writeFile(path.join(workDir, "response.txt"), runResult.text)
 
     // Adapter-level gate (mirrors src/framework/runner.ts): when the run
@@ -176,6 +186,8 @@ async function runInstance(
         passed: false,
         details: `tainted: ${detail}`,
         durationMs,
+        costUsd,
+        tokens,
       }
     }
 
@@ -189,7 +201,7 @@ async function runInstance(
       skipped = true
       const durationMs = performance.now() - startMs
       log.warn(`    instance ${index}: SKIPPED (environment) — ${evalResult.infraError}`)
-      return { instance: index, passed: false, skipped: true, details: `skipped (environment): ${evalResult.infraError}`, durationMs }
+      return { instance: index, passed: false, skipped: true, details: `skipped (environment): ${evalResult.infraError}`, durationMs, costUsd, tokens }
     }
 
     const durationMs = performance.now() - startMs
@@ -197,7 +209,7 @@ async function runInstance(
 
     if (evalResult.pass) {
       log.info(`    instance ${index}: PASS (${(durationMs / 1000).toFixed(1)}s, ${runResult.steps.length} steps)`)
-      return { instance: index, passed: true, details: evalResult.details, durationMs, checkpoints: evalResult.checkpoints }
+      return { instance: index, passed: true, details: evalResult.details, durationMs, costUsd, tokens, checkpoints: evalResult.checkpoints }
     }
 
     // Build rich failure diagnostics
@@ -225,11 +237,11 @@ async function runInstance(
       await writeFile(reportPath, JSON.stringify(diagnostics.report, null, 2))
     }
 
-    return { instance: index, passed: false, details: diagnostics.enrichedDetails, durationMs, failureReport: diagnostics.report, checkpoints: evalResult.checkpoints }
+    return { instance: index, passed: false, details: diagnostics.enrichedDetails, durationMs, costUsd, tokens, failureReport: diagnostics.report, checkpoints: evalResult.checkpoints }
   } catch (err) {
     const durationMs = performance.now() - startMs
     log.warn(`    instance ${index}: ERROR - ${err}`)
-    return { instance: index, passed: false, details: `Error: ${err}`, durationMs }
+    return { instance: index, passed: false, details: `Error: ${err}`, durationMs, costUsd, tokens }
   } finally {
     if (convLog) await convLog.finalize()
     if (passed || skipped) {
@@ -238,6 +250,24 @@ async function runInstance(
       log.warn(`    Preserved failed workDir: ${workDir}`)
     }
   }
+}
+
+/**
+ * Sum billed cost and token usage across a profile's per-primitive details.
+ * Single source for every TCP cost block (final, partial checkpoint, resume) —
+ * summing the persisted details keeps totals correct across resumed runs,
+ * where in-memory accumulators would miss the pre-resume spend.
+ */
+export function sumProfileCost(details: TCP["details"]): { totalUsd: number; totalTokens: TokenUsage } {
+  let totalUsd = 0
+  let totalTokens = emptyTokenUsage()
+  for (const d of details) {
+    for (const lr of d.levelResults) {
+      totalUsd += lr.costUsd
+      totalTokens = addTokenUsage(totalTokens, lr.tokens)
+    }
+  }
+  return { totalUsd, totalTokens }
 }
 
 /**
@@ -270,7 +300,6 @@ export async function profileTarget(opts: {
   const config = opts.config ?? DEFAULT_CONFIG
   const log = createTeeLogger(opts.logFile)
   const startMs = performance.now()
-  let totalTokens = emptyTokenUsage()
 
   const details: TCP["details"] = []
   const capabilities: Record<string, Level> = {}
@@ -314,6 +343,7 @@ export async function profileTarget(opts: {
         skipCount: lr.skipCount,
         durationMs: lr.durationMs,
         costUsd: lr.costUsd,
+        tokens: lr.tokens,
         testDescription: gen.descriptions[lr.level],
         failureDetails: lr.instances
           .filter((i) => !i.passed && !i.skipped)
@@ -354,8 +384,7 @@ export async function profileTarget(opts: {
     capabilities: { ...capabilities },
     details: [...details],
     cost: {
-      totalUsd: 0,
-      totalTokens: { ...totalTokens },
+      ...sumProfileCost(details),
       durationMs: performance.now() - startMs,
     },
     isPartial: true,
@@ -441,8 +470,7 @@ export async function profileTarget(opts: {
     capabilities,
     details,
     cost: {
-      totalUsd: 0,
-      totalTokens,
+      ...sumProfileCost(details),
       durationMs,
     },
     isPartial: false,

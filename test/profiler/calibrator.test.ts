@@ -12,6 +12,7 @@ function makeLevelResult(level: "L1" | "L2" | "L3", passed: boolean, passCount =
     instances: [],
     durationMs: 1000,
     costUsd: 0.01,
+    tokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
   }
 }
 

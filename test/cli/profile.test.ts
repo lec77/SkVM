@@ -42,6 +42,7 @@ describe("PROFILE_FLAGS.parse — typed config", () => {
       concurrency: CLI_DEFAULTS.concurrency,
       "adapter-config": undefined,
       "timeout-ms": TIMEOUT_DEFAULTS.taskExec,
+      "export-cost": undefined,
     })
   })
 
@@ -69,6 +70,7 @@ describe("PROFILE_FLAGS.parse — typed config", () => {
       concurrency: 4,
       "adapter-config": "native",
       "timeout-ms": 60000,
+      "export-cost": undefined,
     })
   })
 
@@ -162,7 +164,10 @@ Options:
   --adapter-config=<m>    native | managed (default: defaults.adapterConfigMode in
                           skvm.config.json, falls back to managed). Native uses your
                           real harness config; managed uses providers.routes only.
-  --timeout-ms=<n>        Cap on each microbenchmark probe's adapter execution (ms) (default: ${TIMEOUT_DEFAULTS.taskExec})`,
+  --timeout-ms=<n>        Cap on each microbenchmark probe's adapter execution (ms) (default: ${TIMEOUT_DEFAULTS.taskExec})
+  --export-cost=<path>    Write a per-primitive cost/token CSV
+                          from the cached profiles of --model × --adapter, then exit.
+                          Reads the cache only — no LLM calls.`,
     )
   })
 })

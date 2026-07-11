@@ -1,4 +1,4 @@
-import type { EvalCheckpoint, EvalCriterion, Level } from "../core/types.ts"
+import type { EvalCheckpoint, EvalCriterion, Level, TokenUsage } from "../core/types.ts"
 import type { FailureReport } from "./failure-diagnostics.ts"
 
 /** A difficulty level a generator actually runs ("L0" is never generated). */
@@ -25,6 +25,10 @@ export interface InstanceResult {
   passed: boolean
   details: string
   durationMs: number
+  /** Billed cost of the instance's adapter run (0 when nothing was billed). */
+  costUsd: number
+  /** Token usage of the instance's adapter run. */
+  tokens: TokenUsage
   /** True when the instance was skipped for an environment reason (e.g. a
    *  missing dependency) and must NOT count as a pass or a failure. */
   skipped?: boolean
@@ -46,6 +50,7 @@ export interface LevelResult {
   instances: InstanceResult[]
   durationMs: number
   costUsd: number
+  tokens: TokenUsage
 }
 
 /** Result of profiling one primitive (all levels) */

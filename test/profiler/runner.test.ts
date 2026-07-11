@@ -1,5 +1,5 @@
 import { test, expect, describe } from "bun:test"
-import { profilePrimitive, type ProfileConfig } from "../../src/profiler/runner.ts"
+import { profilePrimitive, sumProfileCost, type ProfileConfig } from "../../src/profiler/runner.ts"
 import type { MicrobenchmarkGenerator } from "../../src/profiler/types.ts"
 import type { AgentAdapter, RunResult } from "../../src/core/types.ts"
 import { emptyTokenUsage } from "../../src/core/types.ts"
@@ -201,5 +201,65 @@ describe("profilePrimitive", () => {
       // Failure detail should mention the runStatus, not an eval-script failure.
       expect(lvl.instances[0]!.details).toContain("tainted")
     }
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Cost & token accounting (the TCP must carry real money)
+// ---------------------------------------------------------------------------
+
+function createBilledMockAdapter(costUsd: number): AgentAdapter {
+  return {
+    name: "mock-billed",
+    async setup() {},
+    async run(task): Promise<RunResult> {
+      return {
+        text: "ok",
+        steps: [{ role: "assistant", text: "ok", toolCalls: [], timestamp: Date.now() }],
+        tokens: { input: 100, output: 50, cacheRead: 10, cacheWrite: 0 },
+        cost: costUsd,
+        durationMs: 10,
+        llmDurationMs: 0,
+        workDir: task.workDir,
+        runStatus: "ok",
+      }
+    },
+    async teardown() {},
+  }
+}
+
+describe("cost and token accounting", () => {
+  const gen: MicrobenchmarkGenerator = {
+    primitiveId: "test.billing",
+    descriptions: { L1: "Test L1", L2: "Test L2", L3: "Test L3" },
+    generate(_level) {
+      return {
+        prompt: "Test",
+        eval: { method: "script", command: "echo ok", expectedExitCode: 0, expectedOutput: "ok" },
+      }
+    },
+  }
+
+  test("each level result sums instance cost and tokens", async () => {
+    const adapter = createBilledMockAdapter(0.005)
+    const result = await profilePrimitive(gen, adapter, { ...config, instancesPerLevel: 2 })
+
+    for (const lr of result.levelResults) {
+      expect(lr.costUsd).toBeCloseTo(0.01, 10) // 2 instances × $0.005
+      expect(lr.tokens).toEqual({ input: 200, output: 100, cacheRead: 20, cacheWrite: 0 })
+    }
+  })
+
+  test("sumProfileCost totals across primitives and levels", () => {
+    const details = [
+      { levelResults: [{ costUsd: 0.01, tokens: { input: 200, output: 100, cacheRead: 20, cacheWrite: 0 } }] },
+      { levelResults: [
+        { costUsd: 0.02, tokens: { input: 300, output: 150, cacheRead: 0, cacheWrite: 5 } },
+        { costUsd: 0.005, tokens: { input: 50, output: 25, cacheRead: 0, cacheWrite: 0 } },
+      ] },
+    ]
+    const { totalUsd, totalTokens } = sumProfileCost(details as never)
+    expect(totalUsd).toBeCloseTo(0.035, 10)
+    expect(totalTokens).toEqual({ input: 550, output: 275, cacheRead: 20, cacheWrite: 5 })
   })
 })

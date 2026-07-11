@@ -297,6 +297,9 @@ export const PrimitiveProfileDetailSchema = z.object({
     skipCount: z.number().default(0),
     durationMs: z.number(),
     costUsd: z.number(),
+    /** Token usage across the level's instances. Defaults to zeros for
+     *  profiles written before cost accounting was wired through. */
+    tokens: TokenUsageSchema.default({ input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }),
     /** What this profiling level tests (from generator descriptions) */
     testDescription: z.string().default(""),
     /** Failure details from failed instances */

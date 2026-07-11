@@ -73,6 +73,11 @@ export const PROFILE_FLAGS = defineFlags(
       default: TIMEOUT_DEFAULTS.taskExec,
       help: "Cap on each microbenchmark probe's adapter execution (ms)",
     },
+    "export-cost": {
+      kind: "string",
+      placeholder: "<path>",
+      help: "Write a per-primitive cost/token CSV\nfrom the cached profiles of --model × --adapter, then exit.\nReads the cache only — no LLM calls.",
+    },
   },
   {
     usage: [
@@ -129,6 +134,29 @@ export async function runProfile(config: ProfileConfig): Promise<void> {
     adapters = [...ALL_ADAPTERS]
   } else {
     adapters = [CLI_DEFAULTS.adapter]
+  }
+
+  // Export mode: emit the profiling-cost CSV from cached profiles and exit.
+  // Missing profiles are a hard error (scriptability rule — the caller must
+  // know the CSV is incomplete rather than silently getting fewer rows).
+  if (config["export-cost"]) {
+    const { loadProfile } = await import("../profiler/index.ts")
+    const { profileCostCsv } = await import("../profiler/cost-export.ts")
+    const entries: TCP[] = []
+    for (const model of models) {
+      for (const harness of adapters) {
+        const tcp = await loadProfile(model, harness)
+        if (!tcp) {
+          console.error(`profile: no cached profile for ${model} -- ${harness}; run 'skvm profile' first`)
+          process.exit(1)
+        }
+        entries.push(tcp)
+      }
+    }
+    await Bun.write(config["export-cost"], profileCostCsv(entries))
+    const rows = entries.reduce((n, e) => n + e.details.length, 0)
+    console.log(`Wrote ${rows} rows (${entries.length} profile(s)) to ${config["export-cost"]}`)
+    return
   }
 
   const primitives = config.primitives?.split(",")

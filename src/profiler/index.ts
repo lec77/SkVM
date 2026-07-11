@@ -1,11 +1,10 @@
 import type { TCP, AdapterConfig, Level } from "../core/types.ts"
 import type { AgentAdapter } from "../core/types.ts"
-import { emptyTokenUsage } from "../core/types.ts"
 import { TIMEOUT_DEFAULTS } from "../core/timeouts.ts"
 import { getAllPrimitives, ALL_PRIMITIVE_IDS } from "../core/primitives.ts"
 import { getGenerator, getAllGenerators } from "./generators/index.ts"
 import type { MicrobenchmarkGenerator, PrimitiveResult } from "./types.ts"
-import { profileTarget, profilePrimitive, type ProfileConfig } from "./runner.ts"
+import { profileTarget, profilePrimitive, sumProfileCost, type ProfileConfig } from "./runner.ts"
 import { loadProfile, saveProfile, loadPartialProfile, savePartialProfile, saveFailureReports } from "./cache.ts"
 import type { FailureReportsSidecar } from "./cache.ts"
 import type { FailureReport } from "./failure-diagnostics.ts"
@@ -128,6 +127,7 @@ export async function profile(opts: ProfileOptions): Promise<TCP> {
       instances: [],
       durationMs: lr.durationMs,
       costUsd: lr.costUsd,
+      tokens: lr.tokens,
     })),
   })))
 
@@ -341,6 +341,7 @@ export async function profileMulti(opts: ProfileMultiOptions): Promise<{
         instances: [],
         durationMs: lr.durationMs,
         costUsd: lr.costUsd,
+        tokens: lr.tokens,
       })),
     })))
 
@@ -387,6 +388,7 @@ function recordPrimitiveResult(
       skipCount: lr.skipCount,
       durationMs: lr.durationMs,
       costUsd: lr.costUsd,
+      tokens: lr.tokens,
       testDescription: gen.descriptions[lr.level],
       failureDetails: lr.instances
         .filter((i) => !i.passed && !i.skipped)
@@ -418,8 +420,7 @@ function buildTcpFromAccumulator(acc: ProfileAccumulator, isPartial: boolean): T
     capabilities: { ...acc.capabilities },
     details: [...acc.details],
     cost: {
-      totalUsd: 0,
-      totalTokens: emptyTokenUsage(),
+      ...sumProfileCost(acc.details),
       durationMs: performance.now() - acc.startMs,
     },
     isPartial,
