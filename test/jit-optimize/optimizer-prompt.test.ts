@@ -65,3 +65,88 @@ describe("buildOptimizerPrompt", () => {
     expect(p).toContain("blockedEvidenceIds")
   })
 })
+
+// ---------------------------------------------------------------------------
+// Target-model awareness (profile-derived, mirroring pass-1's directives)
+// ---------------------------------------------------------------------------
+
+import type { TCP, Level } from "../../src/core/types.ts"
+
+function makeTcp(capabilities: Record<string, Level>): TCP {
+  return {
+    version: "1.0",
+    model: "example/weak-model",
+    harness: "bare-agent",
+    profiledAt: "2026-01-01T00:00:00Z",
+    capabilities,
+    details: [],
+    cost: { totalUsd: 0, totalTokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, durationMs: 0 },
+    isPartial: false,
+  }
+}
+
+const WEAK_CAPS: Record<string, Level> = {
+  "gen.code.shell": "L2", "gen.text.long": "L0", "gen.regex": "L1",
+  "reason.planning": "L1", "tool.exec": "L2", "tool.call.format": "L2",
+  "follow.procedure": "L1",
+}
+const STRONG_CAPS: Record<string, Level> = {
+  "gen.code.shell": "L3", "reason.planning": "L3", "tool.exec": "L3",
+  "tool.call.format": "L3", "follow.procedure": "L3",
+}
+
+describe("buildOptimizerPrompt — target-model awareness", () => {
+  test("without target: no Target Model section, conservative budget unchanged", () => {
+    const p = buildOptimizerPrompt(4, 0)
+    expect(p).not.toContain("## Target Model")
+    expect(p).toContain("net diff under ~50 added lines")
+  })
+
+  test("weak-profile target on a gated run: identity + derived directives + deletion license", () => {
+    const p = buildOptimizerPrompt(4, 0, {
+      model: "example/weak-model",
+      harness: "bare-agent",
+      tcp: makeTcp(WEAK_CAPS),
+    }, true)
+    expect(p).toContain("## Target Model")
+    expect(p).toContain("example/weak-model")
+    // Derived directive from tool.call.format=L2 (scaffold rule)
+    expect(p).toContain("one-liner")
+    // Deletion becomes a first-class move for weak profiles
+    expect(p).toContain("Deleting")
+    expect(p).toContain("per-task regression gate protects")
+    // The flat +50-line additive budget must NOT be the operative rule
+    expect(p).not.toContain("net diff under ~50 added lines")
+  })
+
+  test("weak-profile target on an ungated run: deletion license softened, no gate claim", () => {
+    const p = buildOptimizerPrompt(4, 0, {
+      model: "example/weak-model",
+      harness: "bare-agent",
+      tcp: makeTcp(WEAK_CAPS),
+    }, false)
+    expect(p).toContain("nothing re-checks your output")
+    expect(p).not.toContain("per-task regression gate protects")
+    // Weak-profile size posture still applies — only the license changes.
+    expect(p).not.toContain("net diff under ~50 added lines")
+  })
+
+  test("strong-profile target: identity present, conservative editing retained", () => {
+    const p = buildOptimizerPrompt(4, 0, {
+      model: "example/strong-model",
+      harness: "bare-agent",
+      tcp: makeTcp(STRONG_CAPS),
+    })
+    expect(p).toContain("## Target Model")
+    expect(p).toContain("example/strong-model")
+    expect(p).toContain("net diff under ~50 added lines")
+    expect(p).not.toContain("one-liner")
+  })
+
+  test("target without TCP: identity only, conservative editing retained", () => {
+    const p = buildOptimizerPrompt(4, 0, { model: "m/x", harness: "bare-agent" })
+    expect(p).toContain("## Target Model")
+    expect(p).toContain("m/x")
+    expect(p).toContain("net diff under ~50 added lines")
+  })
+})
