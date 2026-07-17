@@ -1,7 +1,7 @@
 import path from "node:path"
 import { mkdir } from "node:fs/promises"
 import type { BoostCandidate } from "./types.ts"
-import { BoostCandidatesFileSchema } from "./types.ts"
+import { BoostCandidatesFileSchema, normalizeParamDef } from "./types.ts"
 import { runHeadlessAgent, isHeadlessAgentError, type HeadlessAgentDriver } from "../core/headless-agent/index.ts"
 import { createProviderForModel } from "../providers/registry.ts"
 import { extractStructured } from "../providers/structured.ts"
@@ -73,9 +73,14 @@ The file must be a JSON object with this structure:
       "keywords": ["words", "in", "user", "prompts", "that", "trigger", "this"],
       "codeSignature": "regex matching the expected code structure",
       "functionTemplate": "code with \${param} placeholders",
-      "params": {"paramName": "string", "anotherParam": "number"},
-      "materializationType": "shell",
-      "monitoredTools": ["execute_command"]
+      "params": {
+        "paramName": {
+          "type": "string",
+          "description": "what this parameter is",
+          "extractPattern": "regex with ONE capture group that pulls the value out of a user prompt"
+        }
+      },
+      "materializationType": "shell"
     }
   ]
 }
@@ -87,16 +92,40 @@ The file must be a JSON object with this structure:
 - **keywords**: Words in user prompts that trigger this pattern (used for matching)
 - **codeSignature**: Regex that matches the generated code structure. Must be a valid regex.
 - **functionTemplate**: Code with \${param} placeholders for variable parts
-- **params**: Map of parameter name to type ("string" or "number")
+- **params**: Map of parameter name to {type, description, extractPattern}. extractPattern is
+  REQUIRED for every param: a regex with exactly one capture group that extracts the value
+  from a natural-language user prompt (e.g. "weather in ([A-Za-z ]+)\\??$" pulls the city).
+  Test it mentally against the trigger keywords — at runtime, extraction failure means the
+  template cannot run and the agent falls back to the LLM path.
 - **materializationType**: "shell" or "python"
-- **monitoredTools**: Which tool calls to monitor (default: ["execute_command", "write_file"])
+- **monitoredTools**: Which tool calls to monitor. OMIT this field unless you have a specific
+  reason to narrow it — the default set ("execute_command", "write_file", "web_fetch") covers
+  every execution path.
 
 ## Rules
 
 - Be conservative — only identify truly fixed patterns where the code structure doesn't vary.
 - The regex in codeSignature must compile and match the template when params are filled in.
+- Signature robustness: agents may satisfy the same purpose through different tools — running
+  \`curl\` via execute_command, or fetching the URL directly via a web_fetch tool (monitored
+  content is then the JSON args, e.g. {"url":"https://..."}). Anchor codeSignature on the
+  stable core pattern (the API URL shape, the library call), NOT on tool-specific invocation
+  syntax like a \`curl\` prefix.
 - If no solidifiable patterns exist in this skill, write {"candidates": []}.
 - Focus on tool calls (shell commands, file writes) that repeat with the same structure.
+- Derive purposeId from the skill's distinct purposes. Purposes that require reasoning over
+  content, multi-step workflows, or variable output formats are NOT solidifiable — do not
+  emit candidates for them.
+- purposeId must be UNIQUE across candidates: at most one candidate per purpose. If a purpose
+  has several plausible patterns, pick the single most repetitive one.
+- functionTemplate must ONLY use commands, tools, and libraries that the skill's own
+  documentation prescribes (if the skill teaches pypdf, the template uses pypdf — never a
+  substitute like qpdf). The runtime environment is only guaranteed to provide what the
+  skill documents; anything else fails at execution time and demotes the candidate.
+- Every extractPattern must work for EVERY phrasing implied by the keywords: users say
+  "weather in London", "forecast for Tokyo", "merge a.pdf and b.pdf into out.pdf" — cover
+  the in/for/at/of variants. A promoted candidate whose extractPattern cannot pull params
+  from a triggering prompt can never execute and is wasted.
 
 Start by listing files in the current directory and reading SKILL.md, then any referenced files.`
 
@@ -125,16 +154,7 @@ Start by listing files in the current directory and reading SKILL.md, then any r
     const raw = await file.json()
     const parsed = BoostCandidatesFileSchema.parse(raw)
 
-    // Validate each candidate's regex compiles
-    const validated: BoostCandidate[] = []
-    for (const candidate of parsed.candidates) {
-      try {
-        new RegExp(candidate.codeSignature)
-        validated.push(candidate)
-      } catch (e) {
-        log.warn(`Skipping candidate ${candidate.purposeId}: invalid regex "${candidate.codeSignature}" — ${e}`)
-      }
-    }
+    const validated = filterServableCandidates(parsed.candidates, { requireTemplate: true })
 
     log.info(`Generated ${validated.length} boost candidates (cost=$${cost.toFixed(4)})`)
 
@@ -148,6 +168,218 @@ Start by listing files in the current directory and reading SKILL.md, then any r
     if (isProviderError(err) || isHeadlessAgentError(err)) throw err
     log.warn(`Candidate generation failed: ${err}`)
     return { candidates: [], cost: 0 }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Candidate quality gate (shared by every generator)
+// ---------------------------------------------------------------------------
+
+/**
+ * Mechanical acceptance rules for generated candidates. The generation
+ * prompts demand these properties, but prompt-only requirements are not
+ * enforcement: a candidate that promotes at runtime yet cannot serve
+ * (missing or broken extractPattern, duplicate purposeId) only wastes the
+ * promotion gate. Rejections are logged with their reason.
+ */
+export function filterServableCandidates(
+  candidates: BoostCandidate[],
+  opts?: {
+    /** Reject candidates with an empty functionTemplate (final artifacts). */
+    requireTemplate?: boolean
+  },
+): BoostCandidate[] {
+  const accepted: BoostCandidate[] = []
+  const seen = new Set<string>()
+
+  for (const c of candidates) {
+    try {
+      new RegExp(c.codeSignature, "i")
+    } catch (e) {
+      log.warn(`Skipping candidate ${c.purposeId}: invalid regex "${c.codeSignature}" — ${e}`)
+      continue
+    }
+    if (seen.has(c.purposeId)) {
+      log.warn(`Skipping candidate with duplicate purposeId "${c.purposeId}" — at most one candidate per purpose`)
+      continue
+    }
+    if (opts?.requireTemplate && !c.functionTemplate) {
+      log.warn(`Candidate ${c.purposeId} has empty template, skipping`)
+      continue
+    }
+    const badParams: string[] = []
+    for (const [name, value] of Object.entries(c.params)) {
+      const def = normalizeParamDef(name, value)
+      if (!def.extractPattern) {
+        badParams.push(`${name} (no extractPattern)`)
+        continue
+      }
+      try {
+        new RegExp(def.extractPattern, "i")
+      } catch {
+        badParams.push(`${name} (invalid extractPattern)`)
+      }
+    }
+    if (badParams.length > 0) {
+      log.warn(`Skipping candidate ${c.purposeId}: unservable params under regex-only extraction: ${badParams.join(", ")}`)
+      continue
+    }
+    seen.add(c.purposeId)
+    accepted.push(c)
+  }
+
+  return accepted
+}
+
+// ---------------------------------------------------------------------------
+// Online Candidate Refinement (from runtime miss observations)
+// ---------------------------------------------------------------------------
+
+const MAX_REFINE_OBSERVATIONS = 10
+const MAX_REFINE_OBSERVATION_CHARS = 1500
+
+/**
+ * Rewrite an AOT-generated candidate using what the runtime agent ACTUALLY did.
+ *
+ * When a candidate keeps missing but the agent's tool calls look structurally
+ * similar across runs, the AOT prediction was wrong about the surface form
+ * (tool choice, flags, URL format), not about solidifiability. This grounds
+ * the signature/template/keywords/extractPatterns in observed behavior.
+ *
+ * Guardrail: the refined codeSignature must actually match a majority of the
+ * observations that triggered the refinement — otherwise the refinement is
+ * rejected and the caller keeps the original candidate.
+ */
+export async function refineCandidateFromObservations(args: {
+  candidate: BoostCandidate
+  observations: { tool: string; content: string; run?: number }[]
+  prompts: string[]
+  model?: string
+}): Promise<{ candidate: BoostCandidate | null; cost: number }> {
+  const observations = args.observations.slice(-MAX_REFINE_OBSERVATIONS)
+  if (observations.length === 0) return { candidate: null, cost: 0 }
+
+  const observationBlocks = observations
+    .map((o, i) => {
+      const truncated = o.content.length > MAX_REFINE_OBSERVATION_CHARS
+        ? o.content.slice(0, MAX_REFINE_OBSERVATION_CHARS) + "\n... (truncated)"
+        : o.content
+      const runTag = o.run !== undefined ? `, invocation ${o.run}` : ""
+      return `### Observation ${i + 1} (tool: ${o.tool}${runTag})\n\`\`\`\n${truncated}\n\`\`\``
+    })
+    .join("\n\n")
+
+  const prompt = `You maintain candidates for a JIT code-solidification system. A candidate was generated ahead-of-time from skill documentation, but at runtime its codeSignature never matches what the agent actually does, so it can never promote.
+
+## The current (mispredicting) candidate
+
+\`\`\`json
+${JSON.stringify(args.candidate, null, 2)}
+\`\`\`
+
+## What the agent ACTUALLY did (tool calls from the non-matching runs)
+
+${observationBlocks}
+
+## The user prompts that triggered these runs
+
+${args.prompts.map((p) => `- ${p}`).join("\n")}
+
+## Your Task
+
+Rewrite the candidate so it is grounded in the observed behavior:
+
+- **codeSignature**: a LOOSE regex that matches the observed tool-call contents above (test it mentally against EVERY observation — including variants: agents reorder imports, rename variables, and switch between equivalent URL formats run to run). Match 2-3 distinctive API/method calls or the stable URL shape joined by [\\s\\S]*? gaps. NEVER anchor on import statements, import order, variable names, or comments. If the observations show two equivalent surface forms of the same purpose (e.g. two URL format parameters), the signature must match BOTH. For web_fetch observations the monitored content is the JSON arguments string (e.g. {"url":"https://..."}).
+- **functionTemplate**: code that implements the same purpose the way the agent actually does it (same tool/library/URL format seen in the observations), with \${param} placeholders. materializationType "shell" for commands/URLs (curl the URL), "python" for python scripts.
+- **keywords**: words that appear in the triggering user prompts above.
+- **params**: every param needs an extractPattern (regex, ONE capture group) that works on EVERY triggering prompt above.
+- Keep the same purposeId.
+
+If the observations are structurally inconsistent with each other (genuinely not solidifiable), return {"candidates": []}.
+
+Return {"candidates": [<the single rewritten candidate>]}.`
+
+  const model = args.model ?? ANALYSIS_MODEL
+  const provider = createProviderForModel(model)
+
+  try {
+    const { result, tokens, costUsd } = await extractStructured({
+      provider,
+      schema: BoostCandidatesFileSchema,
+      schemaName: "refine_boost_candidate",
+      schemaDescription: "Rewrite a boost candidate grounded in observed runtime behavior",
+      prompt,
+      maxTokens: 4096,
+    })
+    const cost = estimateCost(model, tokens, costUsd)
+
+    const refined = result.candidates[0]
+    if (!refined) {
+      log.info(`Refinement for ${args.candidate.purposeId}: model judged the behavior not solidifiable`)
+      return { candidate: null, cost }
+    }
+
+    // Identity + mechanical guardrails
+    refined.purposeId = args.candidate.purposeId
+    let regex: RegExp
+    try {
+      regex = new RegExp(refined.codeSignature, "i")
+    } catch (e) {
+      log.warn(`Refinement rejected for ${args.candidate.purposeId}: invalid regex "${refined.codeSignature}" — ${e}`)
+      return { candidate: null, cost }
+    }
+    // Coverage is judged per RUN, not per tool call: each run has exactly one
+    // signature-bearing call (the script / the fetch) among setup noise like
+    // `pip install`, so a per-call majority would reject every good signature.
+    // A signature that covers only one surface form of an alternating pattern
+    // would just reproduce the miss loop it was meant to fix — require a
+    // strict majority (more than half) of the observed runs.
+    const runOf = (o: { run?: number }, i: number) => o.run ?? -1 - i // untagged: each its own pseudo-run
+    const allRuns = new Set(observations.map(runOf))
+    const matchedRuns = new Set(observations.filter((o) => regex.test(o.content)).map(runOf))
+    const required = Math.min(allRuns.size, Math.max(2, Math.floor(allRuns.size / 2) + 1))
+    if (matchedRuns.size < required) {
+      log.warn(`Refinement rejected for ${args.candidate.purposeId}: new signature covers only ${matchedRuns.size}/${allRuns.size} observed runs`)
+      return { candidate: null, cost }
+    }
+
+    // A candidate that promotes but whose extractPatterns cannot pull params
+    // from the very prompts that triggered it can never serve. Serving needs
+    // EVERY param from the SAME prompt, so the check is joint: a strict
+    // majority of the triggering prompts must yield all params together —
+    // per-param counts could each pass on a different subset of prompts
+    // while no single prompt is actually servable.
+    if (args.prompts.length > 0) {
+      const paramRegexes: Array<[string, RegExp]> = []
+      for (const [name, value] of Object.entries(refined.params)) {
+        const def = normalizeParamDef(name, value)
+        if (!def.extractPattern) {
+          log.warn(`Refinement rejected for ${args.candidate.purposeId}: param "${name}" has no extractPattern`)
+          return { candidate: null, cost }
+        }
+        try {
+          paramRegexes.push([name, new RegExp(def.extractPattern, "i")])
+        } catch (e) {
+          log.warn(`Refinement rejected for ${args.candidate.purposeId}: param "${name}" has invalid extractPattern — ${e}`)
+          return { candidate: null, cost }
+        }
+      }
+      const servablePrompts = args.prompts.filter((p) =>
+        paramRegexes.every(([, re]) => re.exec(p)?.[1]),
+      ).length
+      const promptsRequired = Math.min(args.prompts.length, Math.floor(args.prompts.length / 2) + 1)
+      if (servablePrompts < promptsRequired) {
+        log.warn(`Refinement rejected for ${args.candidate.purposeId}: all params extract together from only ${servablePrompts}/${args.prompts.length} triggering prompts`)
+        return { candidate: null, cost }
+      }
+    }
+
+    log.info(`Refined candidate ${args.candidate.purposeId} (signature covers ${matchedRuns.size}/${allRuns.size} observed runs, cost=$${cost.toFixed(4)})`)
+    return { candidate: refined, cost }
+  } catch (err) {
+    if (isProviderError(err) || isHeadlessAgentError(err)) throw err
+    log.warn(`Candidate refinement failed: ${err}`)
+    return { candidate: null, cost: 0 }
   }
 }
 
@@ -287,16 +519,9 @@ Identify structural CODE PATTERNS from these snippets that would repeat if the s
 
     const cost = estimateCost(model, tokens, costUsd)
 
-    // Step 5: Validate each candidate's regex compiles
-    const validated: BoostCandidate[] = []
-    for (const candidate of result.candidates) {
-      try {
-        new RegExp(candidate.codeSignature, "i")
-        validated.push(candidate)
-      } catch (e) {
-        log.warn(`Skipping candidate ${candidate.purposeId}: invalid regex "${candidate.codeSignature}" — ${e}`)
-      }
-    }
+    // Step 5: mechanical quality gate (templates are filled in later, so
+    // requireTemplate stays off here)
+    const validated = filterServableCandidates(result.candidates)
 
     log.info(`Generated ${validated.length} boost candidates from conv logs (cost=$${cost.toFixed(4)})`)
 
@@ -451,20 +676,7 @@ Start by reading SKILL.md, then generate templates.`
     const raw = await file.json()
     const parsed = BoostCandidatesFileSchema.parse(raw)
 
-    // Validate: ensure templates are non-empty and regexes still compile
-    const completed: BoostCandidate[] = []
-    for (const c of parsed.candidates) {
-      if (!c.functionTemplate) {
-        log.warn(`Candidate ${c.purposeId} has empty template, skipping`)
-        continue
-      }
-      try {
-        new RegExp(c.codeSignature, "i")
-        completed.push(c)
-      } catch (e) {
-        log.warn(`Skipping candidate ${c.purposeId}: invalid regex — ${e}`)
-      }
-    }
+    const completed = filterServableCandidates(parsed.candidates, { requireTemplate: true })
 
     log.info(`Generated templates for ${completed.length} candidates (cost=$${cost.toFixed(4)})`)
 
