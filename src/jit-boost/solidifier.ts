@@ -12,6 +12,18 @@ const log = createLogger("solidifier")
 const DEFAULT_PROMOTION_THRESHOLD = 3
 const DEFAULT_DEMOTION_THRESHOLD = 3
 
+/** A template execution served in place of an LLM call. */
+export interface ServeEvent {
+  purposeId: string
+  /** Template execution time only. */
+  durationMs: number
+  /** Param-extraction time (regex or LLM) spent before the template ran. */
+  extractionMs: number
+  extractionMethod: "regex" | "llm"
+  /** LLM tokens spent on extraction; zeros for regex extraction. */
+  extractionTokens: { input: number; output: number }
+}
+
 /**
  * Process-lifetime counter of runtime LLM param-extraction failures. Bumped
  * every time `extractParamsFromPrompt` catches an error from its LLM step.
@@ -27,6 +39,9 @@ export function resetRuntimeExtractionFailureCount(): void {
 
 /** Default tools monitored for signature matching */
 const DEFAULT_MONITORED_TOOLS = new Set(["execute_command", "write_file", "web_fetch"])
+
+/** Cap on the per-candidate miss-observation buffer (most recent kept) */
+const MAX_MISS_OBSERVATIONS = 24
 
 /**
  * Extract monitorable content from a tool call.
@@ -50,6 +65,29 @@ export class Solidifier {
   private promotionThreshold: number
   private demotionThreshold: number
   private llmProvider?: LLMProvider
+  private matchGranularity: "tool-call" | "run"
+  /** purposeIds that matched at least once during the current run (run granularity only) */
+  private runMatched = new Set<string>()
+  /**
+   * Template executions served since the last drain (for experiment drivers).
+   * Carries the FULL serve-path cost: template execution plus the param
+   * extraction that preceded it — LLM-assisted extraction spends real time
+   * and tokens, and hiding it would overstate the saving.
+   */
+  private serveEvents: ServeEvent[] = []
+  /** Monitored tool-call contents seen during the current run (run granularity only) */
+  private runObservations: { tool: string; content: string }[] = []
+  /** Monotonic run index stamped onto observations (run granularity only) */
+  private runCounter = 0
+  /**
+   * Per-candidate refinement evidence: cumulative count of non-matching runs
+   * (NOT reset by an interleaved match — alternating match/miss is precisely
+   * the "signature covers only half the pattern space" case refinement fixes)
+   * plus a rolling buffer of recent observations from matched AND missed runs,
+   * so a refiner sees every behavior variant. Each observation is tagged with
+   * its run index so a validator can reason per run, not per tool call.
+   */
+  private missLog = new Map<string, { missRuns: number; observations: { tool: string; content: string; run: number }[] }>()
 
   constructor(
     candidates: BoostCandidate[],
@@ -59,12 +97,21 @@ export class Solidifier {
       promotionThreshold?: number
       demotionThreshold?: number
       llmProvider?: LLMProvider
+      /**
+       * "tool-call" (default): every monitored tool call increments/resets the
+       * consecutive counter — promotion can happen mid-run.
+       * "run": afterLLM only marks candidates as matched; the driver calls
+       * finalizeRun() once per agent run to fold marks into the counters.
+       * Gives per-invocation promotion semantics.
+       */
+      matchGranularity?: "tool-call" | "run"
     },
   ) {
     this.defaultMonitoredTools = opts?.monitoredTools ?? DEFAULT_MONITORED_TOOLS
     this.promotionThreshold = opts?.promotionThreshold ?? DEFAULT_PROMOTION_THRESHOLD
     this.demotionThreshold = opts?.demotionThreshold ?? DEFAULT_DEMOTION_THRESHOLD
     this.llmProvider = opts?.llmProvider
+    this.matchGranularity = opts?.matchGranularity ?? "tool-call"
 
     if (opts?.savedState) {
       // Restore from persisted state
@@ -126,12 +173,135 @@ export class Solidifier {
   }
 
   /**
+   * Fold the current run's matches into the promotion counters.
+   * Only meaningful in "run" granularity — a no-op otherwise. Call once after
+   * each agent run; a run with zero matches resets the consecutive counter.
+   */
+  finalizeRun(): void {
+    if (this.matchGranularity !== "run") return
+    this.runCounter++
+    for (const [purposeId, entry] of this.entries) {
+      if (entry.state.promoted) continue
+      const miss = this.missLog.get(purposeId) ?? { missRuns: 0, observations: [] }
+      miss.observations.push(...this.runObservations.map((o) => ({ ...o, run: this.runCounter })))
+      if (miss.observations.length > MAX_MISS_OBSERVATIONS) {
+        miss.observations.splice(0, miss.observations.length - MAX_MISS_OBSERVATIONS)
+      }
+      if (this.runMatched.has(purposeId)) {
+        entry.state.hitCount++
+        entry.state.consecutiveMatches++
+        log.debug(`Run match: ${purposeId} (consecutive=${entry.state.consecutiveMatches})`)
+        if (entry.state.consecutiveMatches >= this.promotionThreshold) {
+          entry.state.promoted = true
+          entry.promotedAt = new Date().toISOString()
+          log.info(`PROMOTED: ${purposeId} after ${entry.state.consecutiveMatches} consecutive matched runs`)
+        }
+      } else {
+        if (entry.state.consecutiveMatches > 0) {
+          log.debug(`Consecutive reset: ${purposeId} (was ${entry.state.consecutiveMatches})`)
+        }
+        entry.state.consecutiveMatches = 0
+        miss.missRuns++
+      }
+      this.missLog.set(purposeId, miss)
+    }
+    this.runMatched.clear()
+    this.runObservations = []
+  }
+
+  /**
+   * Refinement evidence for a candidate: how many runs its signature has
+   * missed in total, and the agent's recent tool-call contents (from matched
+   * and missed runs alike — a refiner needs to see every behavior variant).
+   */
+  getMissInfo(purposeId: string): { missRuns: number; observations: { tool: string; content: string; run: number }[] } {
+    const miss = this.missLog.get(purposeId)
+    return miss ? { missRuns: miss.missRuns, observations: [...miss.observations] } : { missRuns: 0, observations: [] }
+  }
+
+  /**
+   * Swap in a refined candidate.
+   *
+   * Default: promotion state is reset — the new signature must re-earn its
+   * consecutive matches. With `creditObservedRuns`, the gate is REPLAYED
+   * against the recorded runs instead: the trailing consecutive runs the new
+   * signature covers count as matches (they are real executions — the same
+   * evidence the gate collects prospectively), so a signature that already
+   * covers the last N observed runs promotes immediately. Template-execution
+   * risk is unchanged either way: serving is still guarded by the
+   * fallback/demotion path.
+   */
+  replaceCandidate(
+    purposeId: string,
+    candidate: BoostCandidate,
+    opts?: { creditObservedRuns?: boolean },
+  ): void {
+    const entry = this.entries.get(purposeId)
+    if (!entry) {
+      log.warn(`replaceCandidate: no entry for ${purposeId}`)
+      return
+    }
+
+    let credited = 0
+    if (opts?.creditObservedRuns) {
+      const observations = this.missLog.get(purposeId)?.observations ?? []
+      try {
+        const regex = new RegExp(candidate.codeSignature, "i")
+        const coveredByRun = new Map<number, boolean>()
+        for (const o of observations) {
+          coveredByRun.set(o.run, (coveredByRun.get(o.run) ?? false) || regex.test(o.content))
+        }
+        // Credit only a gap-free streak of covered runs ending at the most
+        // recent completed run. A run with no observations (the agent made no
+        // monitored tool calls) was a miss, and the consecutive gate must not
+        // step over it — otherwise runs 1 and 3 would count as a 2-run streak.
+        let expected = this.runCounter
+        const runsDescending = [...coveredByRun.keys()].sort((a, b) => b - a)
+        for (const run of runsDescending) {
+          if (run !== expected || !coveredByRun.get(run)) break
+          credited++
+          expected--
+        }
+      } catch {
+        // Invalid regex — no credit; the caller's validation should have caught this.
+      }
+    }
+
+    entry.candidate = candidate
+    entry.state.consecutiveMatches = credited
+    entry.state.hitCount += credited
+    entry.state.promoted = false
+    entry.state.fallbackCount = 0
+    entry.promotedAt = undefined
+    if (credited >= this.promotionThreshold) {
+      entry.state.promoted = true
+      entry.promotedAt = new Date().toISOString()
+      log.info(`PROMOTED (retroactive): ${purposeId} — refined signature covers the last ${credited} observed runs`)
+    } else if (credited > 0) {
+      log.info(`Candidate refined for ${purposeId} with ${credited} retroactive matches (threshold ${this.promotionThreshold})`)
+    }
+    this.missLog.delete(purposeId)
+    log.info(`Candidate refined for ${purposeId}: signature="${candidate.codeSignature.slice(0, 80)}"`)
+  }
+
+  /** Return and clear the template executions served since the last drain. */
+  drainServeEvents(): ServeEvent[] {
+    const events = this.serveEvents
+    this.serveEvents = []
+    return events
+  }
+
+  /**
    * Stage 2: afterLLM hook — monitor tool calls for code signature matches.
    */
   createAfterLLMHook(): AfterLLMHook {
     return async (ctx: AfterLLMContext) => {
       for (const tc of ctx.response.toolCalls) {
         const content = extractMonitorableContent(tc)
+
+        if (this.matchGranularity === "run" && content) {
+          this.runObservations.push({ tool: tc.name, content: content.slice(0, 2000) })
+        }
 
         for (const [purposeId, entry] of this.entries) {
           const candidateTools = entry.candidate.monitoredTools
@@ -143,6 +313,10 @@ export class Solidifier {
           try {
             const regex = new RegExp(entry.candidate.codeSignature, "i")
             if (regex.test(content)) {
+              if (this.matchGranularity === "run") {
+                this.runMatched.add(purposeId)
+                continue
+              }
               entry.state.hitCount++
               entry.state.consecutiveMatches++
               log.debug(`Signature match: ${purposeId} (consecutive=${entry.state.consecutiveMatches})`)
@@ -153,6 +327,9 @@ export class Solidifier {
                 log.info(`PROMOTED: ${purposeId} after ${entry.state.consecutiveMatches} consecutive matches`)
               }
             } else {
+              // In run granularity a miss on one tool call must not erase a hit
+              // from another call in the same run — resets happen in finalizeRun().
+              if (this.matchGranularity === "run") continue
               if (entry.state.consecutiveMatches > 0) {
                 log.debug(`Consecutive reset: ${purposeId} (was ${entry.state.consecutiveMatches})`)
               }
@@ -185,9 +362,11 @@ export class Solidifier {
         if (!keywordMatch) continue
 
         try {
+          const extractStart = performance.now()
           const extraction = await extractParamsFromPrompt(ctx.prompt, entry.candidate, {
             llmProvider: this.llmProvider,
           })
+          const extractionMs = performance.now() - extractStart
 
           if (!extraction.complete) {
             log.info(`Solidified ${purposeId}: param extraction failed (${extraction.method}), falling back to agent`)
@@ -212,6 +391,13 @@ export class Solidifier {
           )
 
           if (result.success) {
+            this.serveEvents.push({
+              purposeId,
+              durationMs: result.durationMs,
+              extractionMs,
+              extractionMethod: extraction.method === "llm" ? "llm" : "regex",
+              extractionTokens: extraction.tokens ?? { input: 0, output: 0 },
+            })
             const toolCall: ToolCall = {
               id: `boost-${purposeId}-${Date.now()}`,
               name: "execute_command",
@@ -255,6 +441,8 @@ interface ExtractionResult {
   params: Record<string, string>
   complete: boolean
   method: "regex" | "llm" | "none"
+  /** LLM tokens spent on extraction; absent when no LLM call was made. */
+  tokens?: { input: number; output: number }
 }
 
 /**
@@ -295,9 +483,9 @@ export async function extractParamsFromPrompt(
   // don't hide silently behind `log.warn`.
   if (opts?.llmProvider) {
     try {
-      const llmParams = await extractViaLLM(prompt, defs, opts.llmProvider)
-      if (llmParams && Object.keys(llmParams).length === paramEntries.length) {
-        return { params: llmParams, complete: true, method: "llm" }
+      const llm = await extractViaLLM(prompt, defs, opts.llmProvider)
+      if (llm.params && Object.keys(llm.params).length === paramEntries.length) {
+        return { params: llm.params, complete: true, method: "llm", tokens: llm.tokens }
       }
     } catch (err) {
       runtimeExtractionFailureCount++
@@ -335,13 +523,14 @@ function extractViaRegex(
 
 /**
  * Step 2: Extract params by calling a small LLM with param descriptions.
- * Returns null if the LLM can't determine all values.
+ * `params` is null if the LLM can't determine all values; `tokens` reports
+ * what the call cost either way.
  */
 async function extractViaLLM(
   prompt: string,
   defs: Record<string, ParamDef>,
   provider: LLMProvider,
-): Promise<Record<string, string> | null> {
+): Promise<{ params: Record<string, string> | null; tokens: { input: number; output: number } }> {
   // Build dynamic Zod schema from param definitions
   const schemaShape: Record<string, z.ZodType> = {}
   const paramDescriptions: string[] = []
@@ -362,7 +551,7 @@ Extract the following parameters. Return null for any parameter you cannot deter
 Parameters:
 ${paramDescriptions.join("\n")}`
 
-  const { result } = await extractStructured({
+  const { result, tokens } = await extractStructured({
     provider,
     schema,
     schemaName: "extract_params",
@@ -370,16 +559,17 @@ ${paramDescriptions.join("\n")}`
     prompt: extractPrompt,
     maxTokens: 256,
   })
+  const spent = { input: tokens.input, output: tokens.output }
 
   // Check all params are non-null
   const params: Record<string, string> = {}
   for (const [name] of Object.entries(defs)) {
     const value = (result as Record<string, unknown>)[name]
-    if (value === null || value === undefined) return null
+    if (value === null || value === undefined) return { params: null, tokens: spent }
     params[name] = String(value)
   }
 
-  return params
+  return { params, tokens: spent }
 }
 
 /**

@@ -325,6 +325,272 @@ describe("Solidifier - exportState", () => {
   })
 })
 
+// ---------------------------------------------------------------------------
+// matchGranularity: "run" + serve events (experiment driver support)
+// ---------------------------------------------------------------------------
+
+const RUN_GRANULARITY_CANDIDATE: BoostCandidate = {
+  purposeId: "fetch-current-weather",
+  keywords: ["weather"],
+  codeSignature: "wttr\\.in",
+  functionTemplate: 'echo "weather for ${city}"',
+  params: {
+    city: { type: "string", description: "city name", extractPattern: "weather in ([A-Za-z ]+?)\\??$" },
+  },
+  materializationType: "shell",
+}
+
+function wttrCommand(city: string): { name: string; args: Record<string, unknown> } {
+  return { name: "execute_command", args: { command: `curl -s "wttr.in/${city}?format=3"` } }
+}
+
+describe("Solidifier - matchGranularity=run", () => {
+  test("multiple matching tool calls in one run count once", async () => {
+    const solidifier = new Solidifier([RUN_GRANULARITY_CANDIDATE], { matchGranularity: "run" })
+    const hook = solidifier.createAfterLLMHook()
+    // one run with 3 matching commands — must NOT promote by itself
+    await hook({
+      response: makeLLMResponse([wttrCommand("London"), wttrCommand("London"), wttrCommand("London")]),
+      iteration: 1,
+      workDir: "/tmp",
+    })
+    solidifier.finalizeRun()
+    expect(solidifier.getEntries()[0]!.state.consecutiveMatches).toBe(1)
+    expect(solidifier.getEntries()[0]!.state.promoted).toBe(false)
+  })
+
+  test("promotes after 3 matched runs", async () => {
+    const solidifier = new Solidifier([RUN_GRANULARITY_CANDIDATE], { matchGranularity: "run" })
+    const hook = solidifier.createAfterLLMHook()
+    for (let run = 0; run < 3; run++) {
+      await hook({ response: makeLLMResponse([wttrCommand("Paris")]), iteration: 1, workDir: "/tmp" })
+      solidifier.finalizeRun()
+    }
+    expect(solidifier.getEntries()[0]!.state.promoted).toBe(true)
+    expect(solidifier.getEntries()[0]!.state.hitCount).toBe(3)
+  })
+
+  test("a run without any match resets consecutive count", async () => {
+    const solidifier = new Solidifier([RUN_GRANULARITY_CANDIDATE], { matchGranularity: "run" })
+    const hook = solidifier.createAfterLLMHook()
+    await hook({ response: makeLLMResponse([wttrCommand("Rome")]), iteration: 1, workDir: "/tmp" })
+    solidifier.finalizeRun()
+    await hook({
+      response: makeLLMResponse([{ name: "execute_command", args: { command: "ls -la" } }]),
+      iteration: 1,
+      workDir: "/tmp",
+    })
+    solidifier.finalizeRun()
+    expect(solidifier.getEntries()[0]!.state.consecutiveMatches).toBe(0)
+    expect(solidifier.getEntries()[0]!.state.promoted).toBe(false)
+  })
+
+  test("tool-call granularity (default) is unchanged: 3 matches in one run promote", async () => {
+    const solidifier = new Solidifier([RUN_GRANULARITY_CANDIDATE])
+    const hook = solidifier.createAfterLLMHook()
+    await hook({
+      response: makeLLMResponse([wttrCommand("London"), wttrCommand("London"), wttrCommand("London")]),
+      iteration: 1,
+      workDir: "/tmp",
+    })
+    expect(solidifier.getEntries()[0]!.state.promoted).toBe(true)
+  })
+
+  test("finalizeRun is a no-op in tool-call granularity", async () => {
+    const solidifier = new Solidifier([RUN_GRANULARITY_CANDIDATE])
+    const hook = solidifier.createAfterLLMHook()
+    await hook({ response: makeLLMResponse([wttrCommand("Tokyo")]), iteration: 1, workDir: "/tmp" })
+    solidifier.finalizeRun()
+    expect(solidifier.getEntries()[0]!.state.consecutiveMatches).toBe(1)
+  })
+})
+
+describe("Solidifier - miss observations and candidate replacement (online refine)", () => {
+  test("miss count accumulates across interleaved matches; observations keep every variant", async () => {
+    const solidifier = new Solidifier([RUN_GRANULARITY_CANDIDATE], { matchGranularity: "run" })
+    const hook = solidifier.createAfterLLMHook()
+
+    // two non-matching runs with similar content
+    for (const city of ["London", "Paris"]) {
+      await hook({
+        response: makeLLMResponse([{ name: "execute_command", args: { command: `python3 weather.py --city ${city}` } }]),
+        iteration: 1,
+        workDir: "/tmp",
+      })
+      solidifier.finalizeRun()
+    }
+    let miss = solidifier.getMissInfo("fetch-current-weather")
+    expect(miss.missRuns).toBe(2)
+    expect(miss.observations.length).toBe(2)
+    expect(miss.observations[0]!.tool).toBe("execute_command")
+    expect(miss.observations[0]!.content).toContain("weather.py")
+
+    // an interleaved matching run does NOT erase the evidence — alternating
+    // match/miss is exactly the pattern refinement exists for, and the
+    // refiner must see both variants
+    await hook({ response: makeLLMResponse([wttrCommand("Tokyo")]), iteration: 1, workDir: "/tmp" })
+    solidifier.finalizeRun()
+    miss = solidifier.getMissInfo("fetch-current-weather")
+    expect(miss.missRuns).toBe(2)
+    expect(miss.observations.length).toBe(3)
+    expect(miss.observations[2]!.content).toContain("wttr.in")
+  })
+
+  test("replaceCandidate with creditObservedRuns replays the gate against history", async () => {
+    const solidifier = new Solidifier([RUN_GRANULARITY_CANDIDATE], { matchGranularity: "run" })
+    const hook = solidifier.createAfterLLMHook()
+    // 3 runs the AOT signature misses, but with a stable observable pattern
+    for (const city of ["London", "Paris", "Tokyo"]) {
+      await hook({
+        response: makeLLMResponse([{ name: "execute_command", args: { command: `python3 weather.py --city ${city}` } }]),
+        iteration: 1,
+        workDir: "/tmp",
+      })
+      solidifier.finalizeRun()
+    }
+    expect(solidifier.getEntries()[0]!.state.promoted).toBe(false)
+
+    // refined signature covers all 3 observed runs -> immediate promotion
+    solidifier.replaceCandidate("fetch-current-weather", {
+      ...RUN_GRANULARITY_CANDIDATE,
+      codeSignature: "weather\\.py",
+    }, { creditObservedRuns: true })
+    const entry = solidifier.getEntries()[0]!
+    expect(entry.state.promoted).toBe(true)
+    expect(entry.state.consecutiveMatches).toBe(3)
+    expect(entry.promotedAt).toBeDefined()
+  })
+
+  test("creditObservedRuns counts only the TRAILING covered streak", async () => {
+    const solidifier = new Solidifier([RUN_GRANULARITY_CANDIDATE], { matchGranularity: "run" })
+    const hook = solidifier.createAfterLLMHook()
+    // run 1: weather.py; run 2: unrelated; runs 3-4: weather.py
+    const commands = ["python3 weather.py --city London", "ls -la", "python3 weather.py --city Paris", "python3 weather.py --city Rome"]
+    for (const command of commands) {
+      await hook({ response: makeLLMResponse([{ name: "execute_command", args: { command } }]), iteration: 1, workDir: "/tmp" })
+      solidifier.finalizeRun()
+    }
+    solidifier.replaceCandidate("fetch-current-weather", {
+      ...RUN_GRANULARITY_CANDIDATE,
+      codeSignature: "weather\\.py",
+    }, { creditObservedRuns: true })
+    const entry = solidifier.getEntries()[0]!
+    // trailing streak is runs 4,3 = 2 (run 2 breaks it) -> not promoted yet
+    expect(entry.state.promoted).toBe(false)
+    expect(entry.state.consecutiveMatches).toBe(2)
+
+    // one live match completes the gate
+    await hook({
+      response: makeLLMResponse([{ name: "execute_command", args: { command: "python3 weather.py --city Oslo" } }]),
+      iteration: 1,
+      workDir: "/tmp",
+    })
+    solidifier.finalizeRun()
+    expect(solidifier.getEntries()[0]!.state.promoted).toBe(true)
+  })
+
+  test("creditObservedRuns does not step over unobserved runs", async () => {
+    const solidifier = new Solidifier([RUN_GRANULARITY_CANDIDATE], { matchGranularity: "run" })
+    const hook = solidifier.createAfterLLMHook()
+    // run 1: covered; run 2: NO tool calls at all; runs 3-4: covered.
+    // Nonconsecutive covered runs (1 and 3-4) must not form a streak of 3.
+    await hook({ response: makeLLMResponse([{ name: "execute_command", args: { command: "python3 weather.py --city London" } }]), iteration: 1, workDir: "/tmp" })
+    solidifier.finalizeRun()
+    solidifier.finalizeRun() // empty run — a miss with nothing observed
+    for (const city of ["Paris", "Rome"]) {
+      await hook({ response: makeLLMResponse([{ name: "execute_command", args: { command: `python3 weather.py --city ${city}` } }]), iteration: 1, workDir: "/tmp" })
+      solidifier.finalizeRun()
+    }
+    solidifier.replaceCandidate("fetch-current-weather", {
+      ...RUN_GRANULARITY_CANDIDATE,
+      codeSignature: "weather\\.py",
+    }, { creditObservedRuns: true })
+    const entry = solidifier.getEntries()[0]!
+    expect(entry.state.promoted).toBe(false)
+    expect(entry.state.consecutiveMatches).toBe(2) // runs 4,3 only — run 2 is a hole
+  })
+
+  test("creditObservedRuns gives zero credit when the most recent run is unobserved", async () => {
+    const solidifier = new Solidifier([RUN_GRANULARITY_CANDIDATE], { matchGranularity: "run" })
+    const hook = solidifier.createAfterLLMHook()
+    for (const city of ["London", "Paris", "Tokyo"]) {
+      await hook({ response: makeLLMResponse([{ name: "execute_command", args: { command: `python3 weather.py --city ${city}` } }]), iteration: 1, workDir: "/tmp" })
+      solidifier.finalizeRun()
+    }
+    solidifier.finalizeRun() // run 4: empty — the streak must end here, not at run 3
+    solidifier.replaceCandidate("fetch-current-weather", {
+      ...RUN_GRANULARITY_CANDIDATE,
+      codeSignature: "weather\\.py",
+    }, { creditObservedRuns: true })
+    const entry = solidifier.getEntries()[0]!
+    expect(entry.state.promoted).toBe(false)
+    expect(entry.state.consecutiveMatches).toBe(0)
+  })
+
+  test("replaceCandidate swaps the candidate and resets promotion state", async () => {
+    const solidifier = new Solidifier([RUN_GRANULARITY_CANDIDATE], { matchGranularity: "run" })
+    const hook = solidifier.createAfterLLMHook()
+    for (let run = 0; run < 3; run++) {
+      await hook({ response: makeLLMResponse([wttrCommand("Rome")]), iteration: 1, workDir: "/tmp" })
+      solidifier.finalizeRun()
+    }
+    expect(solidifier.getEntries()[0]!.state.promoted).toBe(true)
+
+    solidifier.replaceCandidate("fetch-current-weather", {
+      ...RUN_GRANULARITY_CANDIDATE,
+      codeSignature: "weather\\.py",
+    })
+    const entry = solidifier.getEntries()[0]!
+    expect(entry.candidate.codeSignature).toBe("weather\\.py")
+    expect(entry.state.promoted).toBe(false)
+    expect(entry.state.consecutiveMatches).toBe(0)
+
+    // promotion must be re-earned with the NEW signature
+    for (let run = 0; run < 3; run++) {
+      await hook({
+        response: makeLLMResponse([{ name: "execute_command", args: { command: "python3 weather.py --city Oslo" } }]),
+        iteration: 1,
+        workDir: "/tmp",
+      })
+      solidifier.finalizeRun()
+    }
+    expect(solidifier.getEntries()[0]!.state.promoted).toBe(true)
+  })
+})
+
+describe("Solidifier - serve events", () => {
+  test("successful template execution is recorded and drainable", async () => {
+    const solidifier = new Solidifier([RUN_GRANULARITY_CANDIDATE], { matchGranularity: "run" })
+    // force promotion via 3 matched runs
+    const afterLLM = solidifier.createAfterLLMHook()
+    for (let run = 0; run < 3; run++) {
+      await afterLLM({ response: makeLLMResponse([wttrCommand("Tokyo")]), iteration: 1, workDir: "/tmp" })
+      solidifier.finalizeRun()
+    }
+    expect(solidifier.getEntries()[0]!.state.promoted).toBe(true)
+
+    const beforeLLM = solidifier.createBeforeLLMHook()
+    const result = await beforeLLM({
+      prompt: "What is the current weather in Berlin?",
+      workDir: "/tmp",
+      iteration: 0,
+      previousToolCalls: [],
+    })
+    expect(result.action).toBe("replace")
+
+    const events = solidifier.drainServeEvents()
+    expect(events.length).toBe(1)
+    expect(events[0]!.purposeId).toBe("fetch-current-weather")
+    expect(events[0]!.durationMs).toBeGreaterThan(0)
+    // extraction accounting: regex path spends time but no tokens
+    expect(events[0]!.extractionMethod).toBe("regex")
+    expect(events[0]!.extractionMs).toBeGreaterThanOrEqual(0)
+    expect(events[0]!.extractionTokens).toEqual({ input: 0, output: 0 })
+    // drained — second call is empty
+    expect(solidifier.drainServeEvents().length).toBe(0)
+  })
+})
+
 describe("Solidifier - configurable monitor scope", () => {
   test("web_fetch is monitored by default", async () => {
     const candidate: BoostCandidate = {
