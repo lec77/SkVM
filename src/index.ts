@@ -60,6 +60,7 @@ Commands:
   bench        Benchmark skills across conditions and models
   jit-optimize Optimize a skill from synthetic, real, or log evidence
   proposals    List, inspect, accept, or reject proposals
+  jit-boost    Compile boost candidates and run code-solidification cases
   clean-jit    Remove persisted JIT artifacts for a model+adapter
   logs         List recent runs across subsystems
   config       Configure providers, adapters, and paths (init / show / doctor)
@@ -111,6 +112,16 @@ Use --help with any command for details.`)
     case "proposals": {
       const { runProposals } = await import("./cli/proposals.ts")
       await runProposals(args.slice(1))
+      break
+    }
+    case "jit-boost": {
+      const { runJitBoost } = await import("./cli/jit-boost.ts")
+      const { exitOnUsageError } = await import("./cli/flags.ts")
+      try {
+        await runJitBoost(args.slice(1))
+      } catch (err) {
+        exitOnUsageError(err)
+      }
       break
     }
     case "clean-jit": {
